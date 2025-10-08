@@ -1,0 +1,8 @@
+sweep_param,sweep_value,experiment_type,participation_dist,power_ITT_participation,power_TOT_participation,power_ITT_VCU,power_TOT_VCU
+effect_meeting,1,community_level,negbin,0.15333333333333332,0.16666666666666666,0.3433333333333333,0.35333333333333333
+effect_meeting,1.05,community_level,negbin,0.16,0.14666666666666667,0.33,0.31
+effect_meeting,1.1,community_level,negbin,0.14333333333333334,0.14333333333333334,0.33,0.31
+effect_meeting,1.15,community_level,negbin,0.13,0.12666666666666668,0.35333333333333333,0.34
+effect_meeting,1.2,community_level,negbin,0.16,0.18333333333333332,0.36,0.3433333333333333
+effect_meeting,1.25,community_level,negbin,0.12666666666666668,0.13333333333333333,0.32,0.3
+effect_meeting,1.3,community_level,negbin,0.14666666666666667,0.15333333333333332,0.33666666666666667,0.33666666666666667
