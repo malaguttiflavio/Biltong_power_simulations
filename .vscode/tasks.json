@@ -1,0 +1,13 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run n_communities sweep smoke test",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r | tail -n 80",
+			"args": [],
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}
