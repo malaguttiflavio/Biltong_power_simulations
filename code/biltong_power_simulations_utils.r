@@ -62,6 +62,8 @@ ar1_series <- function(times_vec, rho, sigma = 1) {
 
 # Draw counts from Poisson or NegBin given mean mu
 r_count <- function(n, mu, family = c("poisson","negbin"), theta = 1) {
+  # 'none' handled upstream; if passed here just return mu
+  if (length(family) == 1 && tolower(family) == "none") return(mu)
   family <- match.arg(family)
   if(length(n) == 1 && length(mu) > 1) n <- length(mu)
   if(length(mu) == 1 && n > 1) mu <- rep(mu, n)

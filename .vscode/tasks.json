@@ -8,6 +8,128 @@
 			"args": [],
 			"problemMatcher": [],
 			"group": "build"
+		},
+		{
+			"label": "Run biltong power simulation",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r",
+			"args": [],
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run biltong power simulation (refresh)",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r",
+			"args": [],
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run biltong power simulation after legend fix",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r",
+			"args": [],
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run biltong power simulation after legend fix (2)",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r | tail -n 60",
+			"args": [],
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run biltong power simulation after series+styling fix",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r | tail -n 80",
+			"args": [],
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run biltong power simulation new filename",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r | tail -n 40",
+			"args": [],
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run biltong power simulation show exports",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r",
+			"args": [],
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run biltong power simulation show exports 2",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r | tail -n 120",
+			"args": [],
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run power master (tail)",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r | tail -n 60",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run power master (tail)",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r | tail -n 60",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run power master (tail)",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r | tail -n 80",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run power master (tail)",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r | tail -n 80",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run power master (tail)",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r | tail -n 60",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run power master (tail)",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r | tail -n 120",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run power master (tail)",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r | tail -n 120",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run power master (tail)",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r | tail -n 60",
+			"problemMatcher": [],
+			"group": "build"
 		}
 	]
 }

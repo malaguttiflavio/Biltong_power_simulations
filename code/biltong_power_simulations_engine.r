@@ -2,16 +2,23 @@
 
 # Parallelized using {furrr} for multicore processing
 # Uses 14 cores based on MacBook Pro M4 Pro
-# Supports multi-arm designs: arms[1] is control; per-arm effects via ate_pct (formerly avg_treatment_effect_pct) and VCU_delta_mean
+# Supports multi-arm designs: arms[1] is control; per-arm effects via ate_pct (formerly avg_treatment_effect_pct) and env_outcome_delta_mean
 simulate_power <- function(
   config,
-  sweep_param = c("ate_pct","n_communities","avg_indiv_per_comm",
-                  "T_outcome","ICC_outcome","AR1_outcome","alloc_ratio"),
+  sweep_param = c(
+    # generic
+    "ate_pct","n_communities","avg_ind_obs_per_comm","alloc_ratio",
+    # canonical soc/env names
+  "soc_outcome_T","soc_outcome_ICC","soc_outcome_AR1_rho","soc_outcome_AR1_var",
+  "env_outcome_T","env_outcome_ICC","env_outcome_AR1_rho","env_outcome_AR1_var",
+    # legacy aliases (mapped internally)
+    "T_outcome","ICC_outcome","AR1_outcome"
+  ),
   sweep_arm = NULL,
   sweep_values = NULL,
   sweep_each_arm = FALSE,  # when TRUE and sweep_param is arm-level (e.g. ate_pct), run an independent sweep for each treatment arm
   parallel_layer = c("inner","outer","both","none"), # choose which layer to parallelize
-  outfile_stem = "power_results",
+  outfile_stem = "biltong_power",
   seed = 1
 ) {
   set.seed(seed)
@@ -34,6 +41,14 @@ simulate_power <- function(
     cols
   }
   sweep_param <- match.arg(sweep_param)
+  # Map legacy sweep_param values to canonical internal names
+  sweep_param <- switch(
+    sweep_param,
+    T_outcome = "soc_outcome_T",
+    ICC_outcome = "soc_outcome_ICC",
+    AR1_outcome = "soc_outcome_AR1_rho",
+    sweep_param
+  )
   # ---------------------- Basic multi-arm validation & normalization ---------------------- #
   normalize_config <- function(cfg) {
     # Ensure arms include control as first element
@@ -89,6 +104,15 @@ simulate_power <- function(
     }
     cfg <- process_alloc(cfg)
 
+    # Default stratification settings: if not provided, and canonical stratifier columns exist,
+    # use all three to stratify randomization at the community level (applies to both experiment types).
+    if (is.null(cfg$stratify_by)) {
+      if (all(c("year_in_program","ngo_id","tribe_id") %in% names(cfg))) {
+        cfg$stratify_by <- c("year_in_program","ngo_id","tribe_id")
+      }
+    }
+    if (is.null(cfg$stratify_exact)) cfg$stratify_exact <- TRUE
+
     # alloc_ratios: must be named and cover all arms, sum to ~1
     # (Already normalized above)
 
@@ -126,27 +150,78 @@ simulate_power <- function(
       cfg$ate_pct <- cfg$ate_pct[setdiff(names(cfg$ate_pct), "control")]
     }
 
-    # VCU_delta_mean: additive effect; default 0
-    if (is.null(cfg$VCU_delta_mean)) {
-      cfg$VCU_delta_mean <- setNames(rep(0, length(treatment_arms)), treatment_arms)
+    # -------------------- Canonical key mapping (consistency) -------------------- #
+    # Map legacy 'outcome_*' to canonical 'soc_outcome_*'
+    if (!is.null(cfg$outcome_dist)       && is.null(cfg$soc_outcome_dist))       cfg$soc_outcome_dist <- cfg$outcome_dist
+    if (!is.null(cfg$outcome_base_mean)  && is.null(cfg$soc_outcome_base_mean))  cfg$soc_outcome_base_mean <- cfg$outcome_base_mean
+    if (!is.null(cfg$theta_outcome)      && is.null(cfg$soc_outcome_theta))      cfg$soc_outcome_theta <- cfg$theta_outcome
+    if (!is.null(cfg$ICC_outcome)        && is.null(cfg$soc_outcome_ICC))        cfg$soc_outcome_ICC <- cfg$ICC_outcome
+  # Accept legacy AR1_outcome or AR1_outcome_rho as aliases
+  if (!is.null(cfg$AR1_outcome_rho)        && is.null(cfg$soc_outcome_AR1_rho))        cfg$soc_outcome_AR1_rho <- cfg$AR1_outcome_rho
+  if (!is.null(cfg$AR1_outcome)            && is.null(cfg$soc_outcome_AR1_rho))        cfg$soc_outcome_AR1_rho <- cfg$AR1_outcome
+  # Map old canonical soc_outcome_AR1 to new soc_outcome_AR1_rho
+  if (!is.null(cfg$soc_outcome_AR1)        && is.null(cfg$soc_outcome_AR1_rho))        cfg$soc_outcome_AR1_rho <- cfg$soc_outcome_AR1
+    if (!is.null(cfg$T_outcome)          && is.null(cfg$soc_outcome_T))          cfg$soc_outcome_T <- cfg$T_outcome
+    if (!is.null(cfg$months_outcome)     && is.null(cfg$soc_outcome_T_months))     cfg$soc_outcome_T_months <- cfg$months_outcome
+
+    # Map old canonical env_outcome_AR1 to new env_outcome_AR1_rho
+    if (!is.null(cfg$env_outcome_AR1)        && is.null(cfg$env_outcome_AR1_rho))        cfg$env_outcome_AR1_rho <- cfg$env_outcome_AR1
+    if (is.null(cfg$env_outcome_delta_mean)) {
+      cfg$env_outcome_delta_mean <- setNames(rep(0, length(treatment_arms)), treatment_arms)
     } else {
-      if (is.null(names(cfg$VCU_delta_mean)) && length(cfg$VCU_delta_mean) == 1 && length(treatment_arms) == 1) {
-        cfg$VCU_delta_mean <- setNames(cfg$VCU_delta_mean, treatment_arms)
+      if (is.null(names(cfg$env_outcome_delta_mean)) && length(cfg$env_outcome_delta_mean) == 1 && length(treatment_arms) == 1) {
+        cfg$env_outcome_delta_mean <- setNames(cfg$env_outcome_delta_mean, treatment_arms)
       }
-      if (is.null(names(cfg$VCU_delta_mean))) stop("VCU_delta_mean must be a named vector with treatment arm names (omit 'control')")
-      missing_vdm <- setdiff(treatment_arms, names(cfg$VCU_delta_mean))
+      if (is.null(names(cfg$env_outcome_delta_mean))) stop("env_outcome_delta_mean must be a named vector with treatment arm names (omit 'control')")
+      missing_vdm <- setdiff(treatment_arms, names(cfg$env_outcome_delta_mean))
       if (length(missing_vdm) > 0) {
-        cfg$VCU_delta_mean <- c(cfg$VCU_delta_mean, setNames(rep(0, length(missing_vdm)), missing_vdm))
+        cfg$env_outcome_delta_mean <- c(cfg$env_outcome_delta_mean, setNames(rep(0, length(missing_vdm)), missing_vdm))
       }
-      cfg$VCU_delta_mean <- cfg$VCU_delta_mean[setdiff(names(cfg$VCU_delta_mean), "control")]
+      cfg$env_outcome_delta_mean <- cfg$env_outcome_delta_mean[setdiff(names(cfg$env_outcome_delta_mean), "control")]
     }
+
+    # Drop legacy keys to avoid accidental use downstream
+  cfg$VCU_delta_mean <- NULL
+    cfg$outcome_dist <- NULL
+    cfg$outcome_base_mean <- NULL
+    cfg$theta_outcome <- NULL
+    cfg$ICC_outcome <- NULL
+    cfg$AR1_outcome <- NULL
+    cfg$T_outcome <- NULL
+    cfg$months_outcome <- NULL
+  cfg$VCU_base_mean <- NULL
+  cfg$VCU_base_sd <- NULL
+  cfg$ICC_VCU <- NULL
+  cfg$AR1_VCU <- NULL
+  cfg$T_VCU <- NULL
+  cfg$months_VCU <- NULL
+
+    # Defaults for strata treatment-effect heterogeneity (variances default to 0 = no extra heterogeneity)
+    if (is.null(cfg$year_in_program_ate))      cfg$year_in_program_ate <- NULL  # vector or named values per level; optional
+    if (is.null(cfg$ngo_id_ate))               cfg$ngo_id_ate <- NULL
+    if (is.null(cfg$tribe_id_ate))             cfg$tribe_id_ate <- NULL
+    if (is.null(cfg$year_in_program_ate_var))  cfg$year_in_program_ate_var <- 0
+    if (is.null(cfg$ngo_id_ate_var))           cfg$ngo_id_ate_var <- 0
+    if (is.null(cfg$tribe_id_ate_var))         cfg$tribe_id_ate_var <- 0
 
     cfg
   }
   config <- normalize_config(config)
+  # Default: include stratifier controls in regressions unless disabled
+  if (is.null(config$use_strata_controls)) config$use_strata_controls <- TRUE
+  # Require ICCs to be explicitly defined
+  if (is.null(config$soc_outcome_ICC)) stop("soc_outcome_ICC must be defined in config (separate from AR1 parameters)")
+  if (is.null(config$env_outcome_ICC)) stop("env_outcome_ICC must be defined in config (separate from AR1 parameters)")
+  # Validate ICC ranges
+  if (!is.numeric(config$soc_outcome_ICC) || any(config$soc_outcome_ICC < 0 | config$soc_outcome_ICC >= 1)) {
+    stop("soc_outcome_ICC must be in [0, 1)")
+  }
+  if (!is.numeric(config$env_outcome_ICC) || any(config$env_outcome_ICC < 0 | config$env_outcome_ICC >= 1)) {
+    stop("env_outcome_ICC must be in [0, 1)")
+  }
   # Defaults for new inference options
   if (is.null(config$cluster_se))     config$cluster_se     <- TRUE
-  if (is.null(config$use_cluster_fe)) config$use_cluster_fe <- FALSE  # If TRUE keeps factor(community_id) in model
+  if (is.null(config$cluster_fe_yn)) config$cluster_fe_yn <- FALSE  # If TRUE keeps factor(community_id) in model
 
   if (!is.null(sweep_arm)) {
     if (is.null(config$arms)) stop("config$arms must be set for multi-arm sweep")
@@ -192,84 +267,180 @@ simulate_power <- function(
     )
     # Individuals per community
     if (cfg_local$sd_indiv_per_comm > 0) {
-      n_i <- pmax(1L, round(rnorm(cfg_local$n_communities, cfg_local$avg_indiv_per_comm, cfg_local$sd_indiv_per_comm)))
+      n_i <- pmax(1L, round(rnorm(cfg_local$n_communities, cfg_local$avg_ind_obs_per_comm, cfg_local$sd_indiv_per_comm)))
     } else {
-      n_i <- rep(cfg_local$avg_indiv_per_comm, cfg_local$n_communities)
+      n_i <- rep(cfg_local$avg_ind_obs_per_comm, cfg_local$n_communities)
     }
     comm$N_indiv <- n_i
 
     if (cfg_local$experiment_type == "community_level") {
       # Participation panel: community-time
-      df_p <- comm |>
+  df_soc <- comm |>
         rowwise() |>
-  mutate(times = list(cfg_local$months_outcome)) |>
+  mutate(times = list(cfg_local$soc_outcome_T_months)) |>
         unnest(times) |>
         mutate(time = times, .keep = "unused") |>
         ungroup()
-      # VCU panel: community-time
-      df_v <- comm |>
+  # Environmental panel: community-time
+  df_env <- comm |>
         rowwise() |>
-  mutate(times = list(cfg_local$months_VCU)) |>
+  mutate(times = list(cfg_local$env_outcome_T_months)) |>
         unnest(times) |>
         mutate(time = times, .keep = "unused") |>
         ungroup()
     } else {
       # individual_within_community
-      df_p <- comm |>
+  df_soc <- comm |>
         rowwise() |>
-  mutate(indiv = list(1:N_indiv), times = list(cfg_local$months_outcome)) |>
+  mutate(indiv = list(1:N_indiv), times = list(cfg_local$soc_outcome_T_months)) |>
         unnest(c(indiv, times)) |>
         rename(time = times) |>
         ungroup()
-      # VCU remains at community-time
-      df_v <- comm |>
+  # Environmental remains at community-time
+  df_env <- comm |>
         rowwise() |>
-  mutate(times = list(cfg_local$months_VCU)) |>
+  mutate(times = list(cfg_local$env_outcome_T_months)) |>
         unnest(times) |>
         mutate(time = times, .keep = "unused") |>
         ungroup()
     }
 
-    list(comm = comm, df_p = df_p, df_v = df_v)
+    list(comm = comm, df_soc = df_soc, df_env = df_env)
+  }
+
+  # Helper: assign arms within strata for balanced randomization
+  assign_arms_stratified <- function(comm_df, arms, alloc_ratios, strat_vars = NULL, exact = TRUE) {
+    # Ensure required columns exist
+    if (!is.null(strat_vars) && length(strat_vars) > 0) {
+      missing <- setdiff(strat_vars, names(comm_df))
+      if (length(missing) > 0) {
+        warning("Stratification variables missing in comm_df: ", paste(missing, collapse=","), "; falling back to unstratified assignment.")
+        strat_vars <- NULL
+      }
+    }
+    # Guarantee names and order
+    probs <- as.numeric(alloc_ratios[arms])
+    if (any(is.na(probs))) stop("alloc_ratios must include all arms for assignment")
+
+    # Split by strata (or single group)
+    if (!is.null(strat_vars) && length(strat_vars) > 0) {
+      groups <- split(comm_df, f = interaction(comm_df[, strat_vars], drop = TRUE))
+    } else {
+      groups <- list(all = comm_df)
+    }
+
+    out_list <- lapply(groups, function(gdf) {
+      n <- nrow(gdf)
+      if (n == 0) return(gdf)
+      if (exact) {
+        # Target counts per arm within stratum using largest remainders method
+        target <- probs * n
+        base_ct <- floor(target)
+        remainder <- n - sum(base_ct)
+        if (remainder > 0) {
+          frac <- target - base_ct
+          # Avoid all-zero frac
+          if (sum(frac) <= 1e-12) frac <- rep(1, length(frac))
+          add_idx <- sample.int(length(arms), size = remainder, replace = FALSE, prob = frac)
+          add_tab <- tabulate(add_idx, nbins = length(arms))
+          ct <- base_ct + add_tab
+        } else {
+          ct <- base_ct
+        }
+        # Create vector of assignments and shuffle
+        arm_vec <- rep(arms, times = ct)
+        # In rare cases due to rounding, length may be < n; pad by sampling arms by probs
+        if (length(arm_vec) < n) {
+          arm_vec <- c(arm_vec, sample(arms, size = n - length(arm_vec), replace = TRUE, prob = probs))
+        } else if (length(arm_vec) > n) {
+          arm_vec <- arm_vec[seq_len(n)]
+        }
+        arm_vec <- sample(arm_vec, size = n, replace = FALSE)
+      } else {
+        arm_vec <- sample(arms, size = n, replace = TRUE, prob = probs)
+      }
+      gdf$arm <- factor(arm_vec, levels = arms)
+      gdf
+    })
+    assigned <- dplyr::bind_rows(out_list)
+    assigned[, c("community_id","arm")]
   }
 
   # One Monte Carlo run returning p-values for ITT and TOT for both outcomes, per treatment arm
-  one_run <- function(config_run) {
+  one_run <- function(config_run, capture_data = FALSE) {
     smp <- make_sample(config_run)
 
     # ----------------------------- Assignment ----------------------------- #
     # Prefer multi-arm assignment using arms + alloc_ratios; fallback to binary alloc_ratio
     if (!is.null(config_run$alloc_ratios) && !is.null(config_run$arms)) {
       stopifnot(abs(sum(as.numeric(config_run$alloc_ratios[config_run$arms])) - 1) < 1e-8)
-      arm_comm <- tibble(
-        community_id = smp$comm$community_id,
-        arm = factor(
-          sample(config_run$arms,
-                 size = nrow(smp$comm),
-                 replace = TRUE,
-                 prob = as.numeric(config_run$alloc_ratios[config_run$arms])),
-          levels = config_run$arms
-        )
+      arm_comm <- assign_arms_stratified(
+        smp$comm,
+        arms = config_run$arms,
+        alloc_ratios = config_run$alloc_ratios,
+        strat_vars = config_run$stratify_by,
+        exact = isTRUE(config_run$stratify_exact)
       )
     } else {
       prob <- if (!is.null(config_run$alloc_ratio)) config_run$alloc_ratio else 0.5
-      arm_comm <- tibble(
-        community_id = smp$comm$community_id,
-        arm = factor(ifelse(rbinom(nrow(smp$comm), 1, prob) == 1, "T1", "control"),
-                     levels = c("control","T1"))
+      # Use the same stratified helper with binary fallback arms
+      bin_arms <- c("control","T1")
+      bin_ar <- c(control = 1 - prob, T1 = prob)
+      arm_comm <- assign_arms_stratified(
+        smp$comm,
+        arms = bin_arms,
+        alloc_ratios = bin_ar,
+        strat_vars = config_run$stratify_by,
+        exact = isTRUE(config_run$stratify_exact)
       )
-      if (is.null(config_run$arms)) config_run$arms <- levels(arm_comm$arm)
-      if (is.null(config_run$alloc_ratios)) config_run$alloc_ratios <- c(control = 1 - prob, T1 = prob)
+      if (is.null(config_run$arms)) config_run$arms <- bin_arms
+      if (is.null(config_run$alloc_ratios)) config_run$alloc_ratios <- bin_ar
     }
 
+    # ---------------------- Strata treatment-effect heterogeneity ---------------------- #
+    # Build per-community additive treatment effects based on stratification variables.
+    # For soc_outcome (log scale), these are added to log(mu) when D==1; for env_outcome (level), added to mean when D==1.
+    gen_level_effects <- function(levels_vec, vec_param, var_param) {
+      lvls <- sort(unique(levels_vec))
+      # If user provided explicit vector, prefer it; attempt name-based match first
+      if (!is.null(vec_param)) {
+        if (!is.null(names(vec_param))) {
+          # Match by names; coerce to character for robust matching
+          nm <- names(vec_param)
+          map <- setNames(rep(0, length(lvls)), as.character(lvls))
+          intersecting <- intersect(as.character(lvls), nm)
+          map[intersecting] <- vec_param[intersecting]
+          return(map)
+        } else if (length(vec_param) == length(lvls)) {
+          return(setNames(as.numeric(vec_param), as.character(lvls)))
+        }
+      }
+      # Otherwise, draw from N(0, var)
+      v <- if (is.null(var_param)) 0 else as.numeric(var_param)
+      sdv <- if (v <= 0) 0 else sqrt(v)
+      setNames(stats::rnorm(length(lvls), mean = 0, sd = sdv), as.character(lvls))
+    }
+    yr_map <- gen_level_effects(smp$comm$year_in_program, config_run$year_in_program_ate, config_run$year_in_program_ate_var)
+    ngo_map <- gen_level_effects(smp$comm$ngo_id,          config_run$ngo_id_ate,          config_run$ngo_id_ate_var)
+    tri_map <- gen_level_effects(smp$comm$tribe_id,        config_run$tribe_id_ate,        config_run$tribe_id_ate_var)
+    tau_comm_df <- tibble(
+      community_id = smp$comm$community_id,
+      tau_strata = as.numeric(yr_map[as.character(smp$comm$year_in_program)]) +
+                   as.numeric(ngo_map[as.character(smp$comm$ngo_id)]) +
+                   as.numeric(tri_map[as.character(smp$comm$tribe_id)])
+    )
+
     if (config_run$experiment_type == "community_level") {
-      df_p <- smp$df_p |> left_join(arm_comm, by = "community_id")
-      df_v <- smp$df_v |> left_join(arm_comm, by = "community_id")
+      df_soc <- smp$df_soc |> left_join(arm_comm, by = "community_id")
+      df_env <- smp$df_env |> left_join(arm_comm, by = "community_id")
     } else {
       # individual_within_community: inherit the community arm
-      df_p <- smp$df_p |> left_join(arm_comm, by = "community_id")
-      df_v <- smp$df_v |> left_join(arm_comm, by = "community_id")
+      df_soc <- smp$df_soc |> left_join(arm_comm, by = "community_id")
+      df_env <- smp$df_env |> left_join(arm_comm, by = "community_id")
     }
+    # Attach strata TE to both panels
+    df_soc <- df_soc |> left_join(tau_comm_df, by = "community_id")
+    df_env <- df_env |> left_join(tau_comm_df, by = "community_id")
 
     # ----------------------------- Compliance ----------------------------- #
     tu_vec <- config_run$take_up
@@ -284,65 +455,93 @@ simulate_power <- function(
         left_join(arm_comm, by = "community_id") |>
         mutate(D = rbinom(n(), 1, tu_vec[as.character(arm)])) |>
         select(community_id, D)
-      df_p <- df_p |> left_join(Dc, by = "community_id")
-      df_v <- df_v |> left_join(Dc, by = "community_id")
+      df_soc <- df_soc |> left_join(Dc, by = "community_id")
+      df_env <- df_env |> left_join(Dc, by = "community_id")
     } else {
-      df_p <- df_p |> mutate(D = rbinom(n(), 1, tu_vec[as.character(arm)]))
-      agg <- df_p |>
+      df_soc <- df_soc |> mutate(D = rbinom(n(), 1, tu_vec[as.character(arm)]))
+      agg <- df_soc |>
         group_by(community_id) |>
         summarize(D_bar = mean(D), .groups = "drop")
-      df_v <- df_v |> left_join(agg, by = "community_id")
-      df_v$D <- df_v$D_bar
+      df_env <- df_env |> left_join(agg, by = "community_id")
+      df_env$D <- df_env$D_bar
     }
 
     # ------------------- Participation outcome generation ------------------ #
     if (config_run$experiment_type == "community_level") {
-      var_e_p <- 1
-      var_u_p <- ifelse(config_run$ICC_outcome >= 0.999, 1e6, config_run$ICC_outcome/(1-config_run$ICC_outcome))
-      u_comm_p <- rnorm(config_run$n_communities, 0, sqrt(var_u_p))
-      df_p <- df_p |>
+      # AR(1) innovation variance for socio-economic outcome, defaulting to 1 if not provided
+      var_e_p <- if (!is.null(config_run$soc_outcome_AR1_var)) config_run$soc_outcome_AR1_var else 1
+      # Between-community random intercept variance: decoupled from AR1 variance.
+      # Use ICC alone on its own scale: var_u = ICC / (1 - ICC)
+      if (config_run$soc_outcome_ICC >= 1 || config_run$soc_outcome_ICC < 0) stop("soc_outcome_ICC must be in [0,1)")
+      var_u_p <- if (config_run$soc_outcome_ICC == 0) 0 else (config_run$soc_outcome_ICC / (1 - config_run$soc_outcome_ICC))
+      u_comm_p <- rnorm(config_run$n_communities, 0, sqrt(pmax(var_u_p, 0)))
+      sigma_e_p <- if (var_e_p <= 0) 0 else sqrt(var_e_p)
+      df_soc <- df_soc |>
         left_join(tibble(community_id = 1:config_run$n_communities, u_comm_p), by = "community_id") |>
         group_by(community_id) |>
         arrange(time, .by_group = TRUE) |>
-        mutate(e_ar = ar1_series(time, rho = config_run$AR1_outcome, sigma = sqrt(var_e_p))) |>
+        mutate(e_ar = ar1_series(time, rho = config_run$soc_outcome_AR1_rho, sigma = sigma_e_p)) |>
         ungroup()
 
-      log_mu_base <- log(pmax(config_run$outcome_base_mean, 1e-6)) + df_p$u_comm_p + df_p$e_ar
+      log_mu_base <- log(pmax(config_run$soc_outcome_base_mean, 1e-6)) + df_soc$u_comm_p + df_soc$e_ar
       # Per-arm multiplicative effects, realized only when D==1
   mrr  <- config_run$ate_pct
-      mult <- rep(1, nrow(df_p))
-      if (!is.null(mrr)) for (nm in names(mrr)) mult[df_p$arm == nm] <- mult[df_p$arm == nm] * mrr[[nm]]
-      log_mu <- log_mu_base + log(mult) * df_p$D
+      mult <- rep(1, nrow(df_soc))
+      if (!is.null(mrr)) for (nm in names(mrr)) mult[df_soc$arm == nm] <- mult[df_soc$arm == nm] * mrr[[nm]]
+  log_mu <- log_mu_base + log(mult) * df_soc$D + df_soc$tau_strata * df_soc$D
       mu <- pmax(exp(log_mu), 1e-6)
-      df_p$Y <- r_count(length(mu), mu, family = config_run$outcome_dist, theta = config_run$theta_outcome)
+      if (identical(tolower(config_run$soc_outcome_dist), "none")) {
+        # Deterministic: use expected mean directly
+        df_soc$Y <- mu
+      } else {
+        df_soc$Y <- r_count(length(mu), mu, family = config_run$soc_outcome_dist, theta = config_run$soc_outcome_theta)
+      }
     } else {
-      var_e_p <- 1
-      var_u_p <- ifelse(config_run$ICC_outcome >= 0.999, 1e6, config_run$ICC_outcome/(1-config_run$ICC_outcome))
-      u_comm_p <- rnorm(config_run$n_communities, 0, sqrt(var_u_p))
-      df_p <- df_p |>
+      # individual_within_community
+      var_e_p <- if (!is.null(config_run$soc_outcome_AR1_var)) config_run$soc_outcome_AR1_var else 1
+      if (config_run$soc_outcome_ICC >= 1 || config_run$soc_outcome_ICC < 0) stop("soc_outcome_ICC must be in [0,1)")
+      var_u_p <- if (config_run$soc_outcome_ICC == 0) 0 else (config_run$soc_outcome_ICC / (1 - config_run$soc_outcome_ICC))
+      u_comm_p <- rnorm(config_run$n_communities, 0, sqrt(pmax(var_u_p, 0)))
+      sigma_e_p <- if (var_e_p <= 0) 0 else sqrt(var_e_p)
+      df_soc <- df_soc |>
         left_join(tibble(community_id = 1:config_run$n_communities, u_comm_p), by = "community_id") |>
         group_by(community_id, indiv) |>
         arrange(time, .by_group = TRUE) |>
-        mutate(e_ar = ar1_series(time, rho = config_run$AR1_outcome, sigma = sqrt(var_e_p))) |>
+        mutate(e_ar = ar1_series(time, rho = config_run$soc_outcome_AR1_rho, sigma = sigma_e_p)) |>
         ungroup()
 
-      log_mu_base <- log(pmax(config_run$outcome_base_mean, 1e-6)) + df_p$u_comm_p + df_p$e_ar
+      log_mu_base <- log(pmax(config_run$soc_outcome_base_mean, 1e-6)) + df_soc$u_comm_p + df_soc$e_ar
   mrr  <- config_run$ate_pct
-      mult <- rep(1, nrow(df_p))
-      if (!is.null(mrr)) for (nm in names(mrr)) mult[df_p$arm == nm] <- mult[df_p$arm == nm] * mrr[[nm]]
-      log_mu <- log_mu_base + log(mult) * df_p$D
+      mult <- rep(1, nrow(df_soc))
+      if (!is.null(mrr)) for (nm in names(mrr)) mult[df_soc$arm == nm] <- mult[df_soc$arm == nm] * mrr[[nm]]
+  log_mu <- log_mu_base + log(mult) * df_soc$D + df_soc$tau_strata * df_soc$D
       mu <- pmax(exp(log_mu), 1e-6)
-      df_p$Y <- r_count(length(mu), mu, family = config_run$outcome_dist, theta = config_run$theta_outcome)
+      if (identical(tolower(config_run$soc_outcome_dist), "none")) {
+        df_soc$Y <- mu
+      } else {
+        df_soc$Y <- r_count(length(mu), mu, family = config_run$soc_outcome_dist, theta = config_run$soc_outcome_theta)
+      }
     }
 
     # ----------------------------- Participation OLS ----------------------------- #
-    df_p$arm <- factor(df_p$arm, levels = config_run$arms)
-    form_p <- if (isTRUE(config_run$use_cluster_fe)) {
-      Y ~ arm + factor(time) + factor(community_id)
-    } else {
-      Y ~ arm + factor(time)
+    df_soc$arm <- factor(df_soc$arm, levels = config_run$arms)
+    # Optional stratifier controls
+    strata_terms <- NULL
+    if (isTRUE(config_run$use_strata_controls)) {
+      st <- c("year_in_program","ngo_id","tribe_id")
+      st <- st[st %in% names(df_soc)]
+      if (length(st) > 0) {
+        strata_terms <- paste0("factor(", st, ")")
+      }
     }
-    fit_itt_p <- lm(form_p, data = df_p)
+    base_terms <- c("arm", "factor(time)", strata_terms)
+    rhs_no_fe <- paste(base_terms[!is.na(base_terms) & base_terms != ""], collapse = " + ")
+    form_p <- if (isTRUE(config_run$cluster_fe_yn)) {
+      as.formula(paste("Y ~", paste(c(rhs_no_fe, "factor(community_id)"), collapse = " + ")))
+    } else {
+      as.formula(paste("Y ~", rhs_no_fe))
+    }
+    fit_itt_p <- lm(form_p, data = df_soc)
     if (isTRUE(config_run$cluster_se)) {
       vc_p <- tryCatch(sandwich::vcovCL(fit_itt_p, cluster = ~ community_id), error = function(e) sandwich::vcovHC(fit_itt_p, type = config_run$hc_type))
       ct_p <- lmtest::coeftest(fit_itt_p, vcov. = vc_p)
@@ -364,16 +563,21 @@ simulate_power <- function(
 
     # TOT (IV) per arm: run separate IV using only control + that arm for clarity
     for (a in trt_arms) {
-      df_sub <- df_p[df_p$arm %in% c("control", a), , drop = FALSE]
+      df_sub <- df_soc[df_soc$arm %in% c("control", a), , drop = FALSE]
       # Re-factor for subset to avoid singularities
       df_sub$arm <- droplevels(df_sub$arm)
       df_sub$Z_eval <- as.integer(df_sub$arm == a)
-  use_fe_iv_p <- isTRUE(config_run$use_cluster_fe) && !(config_run$experiment_type == "community_level")
-  if (isTRUE(config_run$use_cluster_fe) && config_run$experiment_type == "community_level") use_fe_iv_p <- FALSE
-      iv_form_sub <- if (use_fe_iv_p) {
-        formula(Y ~ D + factor(time) + factor(community_id) | Z_eval + factor(time) + factor(community_id))
+      use_fe_iv_p <- isTRUE(config_run$cluster_fe_yn) && !(config_run$experiment_type == "community_level")
+      if (isTRUE(config_run$cluster_fe_yn) && config_run$experiment_type == "community_level") use_fe_iv_p <- FALSE
+      strata_rhs <- if (!is.null(strata_terms) && length(strata_terms) > 0) paste("+", paste(strata_terms, collapse = " + ")) else ""
+      if (use_fe_iv_p) {
+        iv_form_sub <- as.formula(paste(
+          "Y ~ D + factor(time)", strata_rhs, "+ factor(community_id) | Z_eval + factor(time)", strata_rhs, "+ factor(community_id)"
+        ))
       } else {
-        Y ~ D + factor(time) | Z_eval + factor(time)
+        iv_form_sub <- as.formula(paste(
+          "Y ~ D + factor(time)", strata_rhs, "| Z_eval + factor(time)", strata_rhs
+        ))
       }
       iv_fit_sub <- tryCatch(AER::ivreg(iv_form_sub, data = df_sub), error = function(e) NULL)
       if (!is.null(iv_fit_sub)) {
@@ -389,33 +593,46 @@ simulate_power <- function(
       }
     }
 
-    # ---------------------------- VCU generation ---------------------------- #
-    var_e_v <- config_run$VCU_base_sd^2
-    var_u_v <- ifelse(config_run$ICC_VCU >= 0.999, 1e6, (var_e_v * config_run$ICC_VCU) / (1 - config_run$ICC_VCU))
-    u_comm_v <- rnorm(config_run$n_communities, 0, sqrt(pmax(var_u_v, 1e-8)))
-    df_v <- df_v |>
+    # ---------------------------- Environmental generation ---------------------------- #
+    # AR(1) innovation variance for environmental outcome. If not provided, default to base_sd^2
+    var_e_v <- if (!is.null(config_run$env_outcome_AR1_var)) config_run$env_outcome_AR1_var else (config_run$env_outcome_base_sd^2)
+    # Between-community variance decoupled from AR1 variance; use ICC only
+    if (config_run$env_outcome_ICC >= 1 || config_run$env_outcome_ICC < 0) stop("env_outcome_ICC must be in [0,1)")
+    var_u_v <- if (config_run$env_outcome_ICC == 0) 0 else (config_run$env_outcome_ICC / (1 - config_run$env_outcome_ICC))
+    u_comm_v <- rnorm(config_run$n_communities, 0, sqrt(pmax(var_u_v, 0)))
+    sigma_e_v <- if (var_e_v <= 0) 0 else sqrt(var_e_v)
+    df_env <- df_env |>
       left_join(tibble(community_id = 1:config_run$n_communities, u_comm_v), by = "community_id") |>
       group_by(community_id) |>
       arrange(time, .by_group = TRUE) |>
-      mutate(e_ar = ar1_series(time, rho = config_run$AR1_VCU, sigma = sqrt(pmax(var_e_v, 1e-8)))) |>
+  mutate(e_ar = ar1_series(time, rho = config_run$env_outcome_AR1_rho, sigma = sigma_e_v)) |>
       ungroup()
 
     # Ensure D exists from compliance block
-  if (!"D" %in% names(df_v)) stop("Column D missing in df_v after compliance")
-  df_v$arm <- factor(df_v$arm, levels = config_run$arms)
+  if (!"D" %in% names(df_env)) stop("Column D missing in df_env after compliance")
+  df_env$arm <- factor(df_env$arm, levels = config_run$arms)
 
-  vdm <- config_run$VCU_delta_mean
-    add <- rep(0, nrow(df_v))
-    if (!is.null(vdm)) for (nm in names(vdm)) add[df_v$arm == nm] <- add[df_v$arm == nm] + vdm[[nm]]
-  df_v$Y <- config_run$VCU_base_mean + df_v$u_comm_v + df_v$e_ar + add * df_v$D
+  vdm <- config_run$env_outcome_delta_mean
+    add <- rep(0, nrow(df_env))
+    if (!is.null(vdm)) for (nm in names(vdm)) add[df_env$arm == nm] <- add[df_env$arm == nm] + vdm[[nm]]
+  df_env$Y <- config_run$env_outcome_base_mean + df_env$u_comm_v + df_env$e_ar + add * df_env$D + df_env$tau_strata * df_env$D
 
-    # ------------------------------- VCU OLS -------------------------------- #
-    form_v <- if (isTRUE(config_run$use_cluster_fe)) {
-      Y ~ arm + factor(time) + factor(community_id)
-    } else {
-      Y ~ arm + factor(time)
+    # ------------------------------- Environmental OLS -------------------------------- #
+    # Environmental ITT with optional stratifier controls
+    strata_terms_v <- NULL
+    if (isTRUE(config_run$use_strata_controls)) {
+      st <- c("year_in_program","ngo_id","tribe_id")
+      st <- st[st %in% names(df_env)]
+      if (length(st) > 0) strata_terms_v <- paste0("factor(", st, ")")
     }
-    fit_itt_v <- lm(form_v, data = df_v)
+    base_terms_v <- c("arm", "factor(time)", strata_terms_v)
+    rhs_no_fe_v <- paste(base_terms_v[!is.na(base_terms_v) & base_terms_v != ""], collapse = " + ")
+    form_v <- if (isTRUE(config_run$cluster_fe_yn)) {
+      as.formula(paste("Y ~", paste(c(rhs_no_fe_v, "factor(community_id)"), collapse = " + ")))
+    } else {
+      as.formula(paste("Y ~", rhs_no_fe_v))
+    }
+    fit_itt_v <- lm(form_v, data = df_env)
     if (isTRUE(config_run$cluster_se)) {
       vc_v <- tryCatch(sandwich::vcovCL(fit_itt_v, cluster = ~ community_id), error = function(e) sandwich::vcovHC(fit_itt_v, type = config_run$hc_type))
       ct_v <- lmtest::coeftest(fit_itt_v, vcov. = vc_v)
@@ -423,24 +640,29 @@ simulate_power <- function(
     } else {
       tt_itt_v  <- robust_test(fit_itt_v, hc_type = config_run$hc_type)
     }
-    # ITT per arm (VCU)
+  # ITT per arm (environmental)
     p_itt_v_vec <- setNames(rep(NA_real_, length(trt_arms)), trt_arms)
     for (a in trt_arms) {
       term_a <- paste0("arm", a)
       p_itt_v_vec[a] <- tt_itt_v$p_value[tt_itt_v$term == term_a]
     }
-    # TOT per arm (VCU) via separate IV on control + that arm
+  # TOT per arm (environmental) via separate IV on control + that arm
     p_tot_v_vec <- setNames(rep(NA_real_, length(trt_arms)), trt_arms)
     for (a in trt_arms) {
-      df_sub_v <- df_v[df_v$arm %in% c("control", a), , drop = FALSE]
+      df_sub_v <- df_env[df_env$arm %in% c("control", a), , drop = FALSE]
       df_sub_v$arm <- droplevels(df_sub_v$arm)
       df_sub_v$Z_eval <- as.integer(df_sub_v$arm == a)
-  use_fe_iv_v <- isTRUE(config_run$use_cluster_fe) && !(config_run$experiment_type == "community_level")
-  if (isTRUE(config_run$use_cluster_fe) && config_run$experiment_type == "community_level") use_fe_iv_v <- FALSE
-      iv_form_sub_v <- if (use_fe_iv_v) {
-        formula(Y ~ D + factor(time) + factor(community_id) | Z_eval + factor(time) + factor(community_id))
+      use_fe_iv_v <- isTRUE(config_run$cluster_fe_yn) && !(config_run$experiment_type == "community_level")
+      if (isTRUE(config_run$cluster_fe_yn) && config_run$experiment_type == "community_level") use_fe_iv_v <- FALSE
+      strata_rhs_v <- if (!is.null(strata_terms_v) && length(strata_terms_v) > 0) paste("+", paste(strata_terms_v, collapse = " + ")) else ""
+      if (use_fe_iv_v) {
+        iv_form_sub_v <- as.formula(paste(
+          "Y ~ D + factor(time)", strata_rhs_v, "+ factor(community_id) | Z_eval + factor(time)", strata_rhs_v, "+ factor(community_id)"
+        ))
       } else {
-        Y ~ D + factor(time) | Z_eval + factor(time)
+        iv_form_sub_v <- as.formula(paste(
+          "Y ~ D + factor(time)", strata_rhs_v, "| Z_eval + factor(time)", strata_rhs_v
+        ))
       }
       iv_fit_sub_v <- tryCatch(AER::ivreg(iv_form_sub_v, data = df_sub_v), error = function(e) NULL)
       if (!is.null(iv_fit_sub_v)) {
@@ -463,6 +685,10 @@ simulate_power <- function(
       out_list[[paste0("p_tot_p_", a)]]  <- p_tot_p_vec[a]
       out_list[[paste0("p_itt_v_", a)]]  <- p_itt_v_vec[a]
       out_list[[paste0("p_tot_v_", a)]]  <- p_tot_v_vec[a]
+    }
+    if (isTRUE(capture_data)) {
+      out_list$last_df_soc <- df_soc
+      out_list$last_df_env <- df_env
     }
     out_list
   }
@@ -489,14 +715,22 @@ simulate_power <- function(
         }
       }
     }
-    if (sweep_param == "n_communities")        config_sweep$n_communities      <- as.integer(val)
-    if (sweep_param == "avg_indiv_per_comm")   config_sweep$avg_indiv_per_comm <- as.integer(val)
-    if (sweep_param == "T_outcome") {
-      config_sweep$T_outcome     <- as.integer(val)
-      config_sweep$months_outcome <- seq_len(config_sweep$T_outcome)
+    if (sweep_param == "n_communities")          config_sweep$n_communities        <- as.integer(val)
+    if (sweep_param == "avg_ind_obs_per_comm")   config_sweep$avg_ind_obs_per_comm <- as.integer(val)
+    if (sweep_param == "soc_outcome_T") {
+        config_sweep$soc_outcome_T        <- as.integer(val)
+        config_sweep$soc_outcome_T_months <- seq_len(config_sweep$soc_outcome_T)
     }
-    if (sweep_param == "ICC_outcome")          config_sweep$ICC_outcome <- val
-    if (sweep_param == "AR1_outcome")          config_sweep$AR1_outcome <- val
+    if (sweep_param == "soc_outcome_ICC")      config_sweep$soc_outcome_ICC <- val
+    if (sweep_param == "soc_outcome_AR1_rho")      config_sweep$soc_outcome_AR1_rho <- val
+    if (sweep_param == "env_outcome_T") {
+        config_sweep$env_outcome_T        <- as.integer(val)
+        config_sweep$env_outcome_T_months <- seq_len(config_sweep$env_outcome_T)
+    }
+    if (sweep_param == "env_outcome_ICC")      config_sweep$env_outcome_ICC <- val
+  if (sweep_param == "env_outcome_AR1_rho")      config_sweep$env_outcome_AR1_rho <- val
+  if (sweep_param == "soc_outcome_AR1_var")  config_sweep$soc_outcome_AR1_var <- val
+  if (sweep_param == "env_outcome_AR1_var")  config_sweep$env_outcome_AR1_var <- val
     if (sweep_param == "alloc_ratio")          config_sweep$alloc_ratio <- val  # binary fallback path only
 
   # Monte Carlo over sims (parallelizable layer: inner)
@@ -515,11 +749,15 @@ simulate_power <- function(
       p_tot_p_vec <- sapply(res, `[[`, paste0("p_tot_p_", a))
       p_itt_v_vec <- sapply(res, `[[`, paste0("p_itt_v_", a))
       p_tot_v_vec <- sapply(res, `[[`, paste0("p_tot_v_", a))
-      pow_list[[paste0("power_ITT_participation_", a)]] <- get_rate(p_itt_p_vec)
-      pow_list[[paste0("power_TOT_participation_", a)]] <- get_rate(p_tot_p_vec)
-      pow_list[[paste0("power_ITT_VCU_", a)]] <- get_rate(p_itt_v_vec)
-      pow_list[[paste0("power_TOT_VCU_", a)]] <- get_rate(p_tot_v_vec)
-      # Backward compatibility (single-arm only): also create unsuffixed columns
+      # Socio-economic outcome (generic count outcome)
+      pow_list[[paste0("power_ITT_soc_outcome_", a)]] <- get_rate(p_itt_p_vec)
+      pow_list[[paste0("power_TOT_soc_outcome_", a)]] <- get_rate(p_tot_p_vec)
+  # Environmental outcome
+      pow_list[[paste0("power_ITT_env_outcome_", a)]] <- get_rate(p_itt_v_vec)
+      pow_list[[paste0("power_TOT_env_outcome_", a)]] <- get_rate(p_tot_v_vec)
+  # Backward compatibility aliases (not used downstream here)
+  # pow_list[[paste0("power_ITT_outcome_", a)]] <- pow_list[[paste0("power_ITT_soc_outcome_", a)]]
+  # pow_list[[paste0("power_TOT_outcome_", a)]] <- pow_list[[paste0("power_TOT_soc_outcome_", a)]]
     }
     # ---------------- Add per-arm effect size columns to output ---------------- #
     trt_arms <- setdiff(config_sweep$arms, "control")
@@ -528,34 +766,37 @@ simulate_power <- function(
     if (length(mrr_vals) == 0 && length(trt_arms) > 0) {
       mrr_vals <- setNames(rep(1, length(trt_arms)), trt_arms)
     }
-    # VCU additive effects
-  vdm_vals <- config_sweep$VCU_delta_mean
+  # Environmental additive effects
+  vdm_vals <- config_sweep$env_outcome_delta_mean
     if (length(vdm_vals) == 0 && length(trt_arms) > 0) {
       vdm_vals <- setNames(rep(0, length(trt_arms)), trt_arms)
     }
 
     out_row <- tibble(
-      sweep_param = sweep_param,
-      sweep_value = val,
-  experiment_type = config_sweep$experiment_type,
-  outcome_dist = config_sweep$outcome_dist
+      sweep_param    = sweep_param,
+      sweep_value    = val,
+      experiment_type = config_sweep$experiment_type,
+      outcome_dist    = config_sweep$soc_outcome_dist
     )
     # Bind power columns
     for (nm in names(pow_list)) out_row[[nm]] <- pow_list[[nm]]
     if (length(trt_arms) == 1) {
       # duplicate unsuffixed for single-arm convenience
       a <- trt_arms[1]
-      out_row$power_ITT_participation <- out_row[[paste0("power_ITT_participation_", a)]]
-      out_row$power_TOT_participation <- out_row[[paste0("power_TOT_participation_", a)]]
-      out_row$power_ITT_VCU <- out_row[[paste0("power_ITT_VCU_", a)]]
-      out_row$power_TOT_VCU <- out_row[[paste0("power_TOT_VCU_", a)]]
+      out_row$power_ITT_soc_outcome <- out_row[[paste0("power_ITT_soc_outcome_", a)]]
+      out_row$power_TOT_soc_outcome <- out_row[[paste0("power_TOT_soc_outcome_", a)]]
+      out_row$power_ITT_env_outcome <- out_row[[paste0("power_ITT_env_outcome_", a)]]
+      out_row$power_TOT_env_outcome <- out_row[[paste0("power_TOT_env_outcome_", a)]]
+  # Backward compatibility (old names)
+  out_row$power_ITT_outcome <- out_row$power_ITT_soc_outcome
+  out_row$power_TOT_outcome <- out_row$power_TOT_soc_outcome
     }
     # Append effect size columns explicitly (renamed: arm_ate_pct_*)
     for (a in trt_arms) {
       col_mrr <- paste0("arm_ate_pct_", a)
-      col_vdm <- paste0("arm_VCU_delta_mean_", a)
-      out_row[[col_mrr]] <- unname(mrr_vals[a])
-      out_row[[col_vdm]] <- unname(vdm_vals[a])
+      col_vdm_new <- paste0("arm_env_outcome_delta_mean_", a)
+      out_row[[col_mrr]]    <- unname(mrr_vals[a])
+      out_row[[col_vdm_new]] <- unname(vdm_vals[a])
     }
     if (!is.null(override_arm)) out_row$swept_arm <- override_arm
     out_row
@@ -642,15 +883,19 @@ simulate_power <- function(
   # Reshape for plotting; handle per-arm columns
   long_res <- results |>
     pivot_longer(
-      cols = matches("^power_(ITT|TOT)_(participation|VCU)(_.*)?$"),
+      cols = matches("^power_(ITT|TOT)_(soc_outcome|env_outcome)(_.*)?$"),
       names_to = "metric",
       values_to = "power"
     ) |>
     mutate(
       estimator = sub("^power_(ITT|TOT).*", "\\1", metric),
-      outcome = ifelse(grepl("participation", metric), "Participation", "VCU"),
-      arm = sub("^power_(ITT|TOT)_(participation|VCU)_?", "", metric),
-      arm = ifelse(arm %in% c("participation","VCU",""), NA_character_, arm)
+      outcome = case_when(
+        grepl("soc_outcome", metric) ~ "soc_outcome",
+        grepl("env_outcome", metric) ~ "env_outcome",
+        TRUE ~ NA_character_
+      ),
+      arm = sub("^power_(ITT|TOT)_(soc_outcome|env_outcome)_?", "", metric),
+      arm = ifelse(arm %in% c("soc_outcome","env_outcome",""), NA_character_, arm)
     )
 
   # If independent sweeps per arm, restrict each row's varying power series to the swept arm only for plotting x vs its own effect.
@@ -686,17 +931,16 @@ simulate_power <- function(
     pivot_longer(cols = -all_of(id_cols), names_to = "effect_var", values_to = "arm_ate_pct") |>
     mutate(arm = sub("^arm_ate_pct_", "", effect_var)) |>
     select(-effect_var)
-  effect_vcu_long <- results |>
-    select(all_of(c(id_cols)), starts_with("arm_VCU_delta_mean_")) |>
-    pivot_longer(cols = -all_of(id_cols), names_to = "effect_var", values_to = "arm_VCU_delta_mean") |>
-    mutate(arm = sub("^arm_VCU_delta_mean_", "", effect_var)) |>
+  effect_env_long <- results |>
+    select(all_of(c(id_cols)), starts_with("arm_env_outcome_delta_mean_")) |>
+    pivot_longer(cols = -all_of(id_cols), names_to = "effect_var", values_to = "arm_env_outcome_delta_mean") |>
+    mutate(arm = sub("^arm_env_outcome_delta_mean_", "", effect_var)) |>
     select(-effect_var)
-  effects_join <- full_join(effect_mrr_long, effect_vcu_long, by = c(id_cols, "arm"))
+  effects_join <- full_join(effect_mrr_long, effect_env_long, by = c(id_cols, "arm"))
   long_table <- power_long |>
     left_join(effects_join, by = c(id_cols, "arm")) |>
     mutate(
       scenario_ate_pct = sweep_value,
-      # arm_ate_pct already present from effects_join
       is_swept = ifelse(!is.na(arm) & "swept_arm" %in% names(power_long), arm == swept_arm, TRUE)
     ) |>
     arrange(outcome, estimator, arm, sweep_value)
@@ -714,6 +958,52 @@ simulate_power <- function(
   long_csv_path  <- file.path(tabs_dir, glue::glue("{outfile_stem}_{sweep_param}_long.csv"))
   write_csv(long_table, long_csv_path)
 
+  # -------------------- Export example of the last simulated dataset -------------------- #
+  # Build the config corresponding to the last sweep value to simulate one final dataset
+  last_val <- sweep_values[length(sweep_values)]
+  config_last <- config
+  # Apply the last sweep to config_last (mirror logic from run_for_value)
+  if (sweep_param == "ate_pct") {
+    trt_arms_all <- setdiff(config_last$arms, "control")
+    if (sweep_each_arm) {
+      # Choose the last arm in declared order
+      last_arm <- tail(trt_arms_all, 1)
+      if (is.null(config_last$ate_pct)) stop("ate_pct must be defined in config")
+      config_last$ate_pct[[last_arm]] <- last_val
+    } else if (!is.null(sweep_arm)) {
+      if (is.null(config_last$ate_pct)) stop("ate_pct must be defined in config")
+      config_last$ate_pct[[sweep_arm]] <- last_val
+    } else {
+      # Recycle value across all treatment arms
+      config_last$ate_pct <- setNames(rep(last_val, length(trt_arms_all)), trt_arms_all)
+    }
+  }
+  if (sweep_param == "n_communities")          config_last$n_communities        <- as.integer(last_val)
+  if (sweep_param == "avg_ind_obs_per_comm")   config_last$avg_ind_obs_per_comm <- as.integer(last_val)
+  if (sweep_param == "soc_outcome_T") {
+    config_last$soc_outcome_T        <- as.integer(last_val)
+    config_last$soc_outcome_T_months <- seq_len(config_last$soc_outcome_T)
+  }
+  if (sweep_param == "soc_outcome_ICC")      config_last$soc_outcome_ICC <- last_val
+  if (sweep_param == "soc_outcome_AR1_rho")  config_last$soc_outcome_AR1_rho <- last_val
+  if (sweep_param == "env_outcome_T") {
+    config_last$env_outcome_T        <- as.integer(last_val)
+    config_last$env_outcome_T_months <- seq_len(config_last$env_outcome_T)
+  }
+  if (sweep_param == "env_outcome_ICC")      config_last$env_outcome_ICC <- last_val
+  if (sweep_param == "env_outcome_AR1_rho")  config_last$env_outcome_AR1_rho <- last_val
+  if (sweep_param == "soc_outcome_AR1_var")  config_last$soc_outcome_AR1_var <- last_val
+  if (sweep_param == "env_outcome_AR1_var")  config_last$env_outcome_AR1_var <- last_val
+  if (sweep_param == "alloc_ratio")          config_last$alloc_ratio <- last_val
+
+  # Simulate one dataset with these settings and export
+  last_run <- one_run(config_last, capture_data = TRUE)
+  last_soc <- last_run$last_df_soc |> mutate(outcome = "soc_outcome")
+  last_env <- last_run$last_df_env |> mutate(outcome = "env_outcome")
+  last_combined <- bind_rows(last_soc, last_env)
+  last_data_csv <- file.path(tabs_dir, glue::glue("{outfile_stem}_{sweep_param}_last_sim_data.csv"))
+  write_csv(last_combined, last_data_csv)
+
   base_theme <- theme_minimal(base_size = 12) +
     theme(
       legend.position = "bottom",
@@ -730,28 +1020,29 @@ simulate_power <- function(
     )
 
   caption_text <- glue::glue(
-    "{alloc_caption}, n_communities={config$n_communities}, avg_indiv_per_comm={config$avg_indiv_per_comm},T_outcome={config$T_outcome}, \n",
+    "{alloc_caption}, n_communities={config$n_communities}, avg_ind_obs_per_comm={config$avg_ind_obs_per_comm}, soc_outcome_T={config$soc_outcome_T}, env_outcome_T={config$env_outcome_T};\n",
     "year strata range={paste(range(config$year_in_program), collapse='-')}, NGOs up to 7, tribes up to 5, \n",
-    "alpha={config$alpha}, sims={config$sims}, seed={seed}, arms={paste(config$arms, collapse=',')}, {takeup_caption}, ICC_outcome={config$ICC_outcome};\n",
-    "outcome_dist={config$outcome_dist}, theta={config$theta_outcome}, base_mean_outcome={config$outcome_base_mean};\n",
-    "VCU_base_mean={config$VCU_base_mean}, VCU_base_sd={config$VCU_base_sd}, T_VCU={config$T_VCU}, ICC_VCU={config$ICC_VCU}, AR1_outcome={config$AR1_outcome}, AR1_VCU={config$AR1_VCU}, SE=Eicker-White {config$hc_type}"
+    "alpha={config$alpha}, sims={config$sims}, seed={seed}, arms={paste(config$arms, collapse=',')}, {takeup_caption};\n",
+    "soc_outcome: dist={config$soc_outcome_dist}, theta={config$soc_outcome_theta}, base_mean={config$soc_outcome_base_mean}, ICC={config$soc_outcome_ICC}, AR1 Rho={config$soc_outcome_AR1_rho}, AR1_var={if (is.null(config$soc_outcome_AR1_var)) 1 else config$soc_outcome_AR1_var};\n",
+  "env_outcome: base_mean={config$env_outcome_base_mean}, base_sd={config$env_outcome_base_sd}, ICC={config$env_outcome_ICC}, AR1 Rho={config$env_outcome_AR1_rho}, AR1_var={if (is.null(config$env_outcome_AR1_var)) (config$env_outcome_base_sd^2) else config$env_outcome_AR1_var}; SE=Eicker-White {config$hc_type}; strata_ate_var: year={config$year_in_program_ate_var}, ngo={config$ngo_id_ate_var}, tribe={config$tribe_id_ate_var}"
   )
 
-  # Participation plot
-  part_df <- long_res |> filter(outcome == "Participation")
+  # Socio-economic outcome plot
+  part_df <- long_res |> filter(outcome == "soc_outcome")
   # Dynamic palette for participation (distinct colors per series)
   part_series_all <- sort(unique(part_df$series))
   if (multi_arm) {
     trt_arms <- setdiff(config$arms, "control")
-    itt_order <- paste("ITT", trt_arms, "Participation", sep = " - ")
-    tot_order <- paste("TOT", trt_arms, "Participation", sep = " - ")
+  # Series keys must match what's in data: we used outcome tokens (soc_outcome)
+  itt_order <- paste("ITT", trt_arms, "soc_outcome", sep = " - ")
+  tot_order <- paste("TOT", trt_arms, "soc_outcome", sep = " - ")
     part_order <- c(itt_order, tot_order)
     # Some safety: keep only those that exist
     part_order <- part_order[part_order %in% part_series_all]
     part_cols_vec <- get_palette(length(part_order), "Dark2")
     part_cols <- setNames(part_cols_vec, part_order)
-    part_labels <- c(paste0("ITT: ", trt_arms, " - Participation"),
-                     paste0("TOT: ", trt_arms, " - Participation"))
+  part_labels <- c(paste0("ITT: ", trt_arms, " - Socio-economic"),
+           paste0("TOT: ", trt_arms, " - Socio-economic"))
     # Align labels to existing order (after filtering existence)
     lab_map <- setNames(part_labels, c(itt_order, tot_order))
     part_labels_final <- lab_map[part_order]
@@ -762,14 +1053,14 @@ simulate_power <- function(
       guide = guide_legend(nrow = 1, byrow = TRUE, direction = "horizontal", label.position = "right")
     )
   } else {
-    # Single arm: keep previous coloring (two series max)
+  # Single arm: keep previous coloring (two series max)
     part_order <- part_series_all
     part_cols <- setNames(get_palette(length(part_order), "Dark2"), part_order)
     # Friendly labels with colon style
-    part_labels_final <- sub("^(ITT) - (Participation)$", "ITT: Participation", part_order)
-    part_labels_final <- sub("^(TOT) - (Participation)$", "TOT: Participation", part_labels_final)
-    part_labels_final <- sub("^(ITT) - ([^-]+) - Participation$", "ITT: \2 - Participation", part_labels_final)
-    part_labels_final <- sub("^(TOT) - ([^-]+) - Participation$", "TOT: \2 - Participation", part_labels_final)
+  part_labels_final <- sub("^(ITT) - (Socio-economic)$", "ITT: Socio-economic", part_order)
+  part_labels_final <- sub("^(TOT) - (Socio-economic)$", "TOT: Socio-economic", part_labels_final)
+  part_labels_final <- sub("^(ITT) - ([^-]+) - Socio-economic$", "ITT: \\2 - Socio-economic", part_labels_final)
+  part_labels_final <- sub("^(TOT) - ([^-]+) - Socio-economic$", "TOT: \\2 - Socio-economic", part_labels_final)
     part_scale <- scale_color_manual(
       values = part_cols,
       breaks = part_order,
@@ -777,92 +1068,147 @@ simulate_power <- function(
       guide = guide_legend(direction = "horizontal", label.position = "right")
     )
   }
-  plt_part <- ggplot(part_df, aes(x = sweep_value, y = power, group = series, color = series)) +
-    geom_line(size = 0.7) +
-    geom_point(size = 2.2) +
+  # Simplified legend: only two entries (ITT solid, TOT dashed); color & linetype both map to estimator.
+  # NOTE: Arms are still distinguished in grouping but share aesthetics; if per-arm distinction is needed later,
+  # we can add facetting or minor alpha jitter. Assumption: user prioritizes compact legend over per-arm color.
+  part_df <- part_df |> filter(!is.na(arm)) |> mutate(group_id = interaction(estimator, arm, drop = TRUE))
+  plt_part <- ggplot(part_df, aes(x = sweep_value, y = power,
+                                  group = group_id,
+                                  color = estimator, linetype = estimator)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 2.0, show.legend = FALSE) +
     geom_hline(yintercept = 0.8, linetype = "dashed", color = "#666666") +
-    part_scale +
+    scale_color_manual(values = c(ITT = "#1b9e77", TOT = "#d95f02"), name = NULL) +
+    scale_linetype_manual(values = c(ITT = "solid", TOT = "dashed"), name = NULL) +
+    guides(color = guide_legend(order = 1), linetype = guide_legend(order = 1)) +
     scale_x_continuous(breaks = unique(results$sweep_value)) +
     scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1), expand = c(0, 0)) +
     labs(
       x = sweep_param,
       y = "Power",
-  title = glue::glue("Power vs {sweep_param} (Participation){if (multi_arm) ' by Arm' else ''}"),
-  subtitle = glue::glue("Design: {unique(results$experiment_type)} | Dist: {unique(results$outcome_dist)}"),
+      title = glue::glue("Power vs {sweep_param} (Socio-economic){if (multi_arm) ' by Arm' else ''}"),
+      subtitle = glue::glue("Design: {unique(results$experiment_type)} | Dist: {unique(results$outcome_dist)}"),
       caption = caption_text
     ) + base_theme
 
-  # VCU plot
-  vcu_df <- long_res |> filter(outcome == "VCU")
-  vcu_series_all <- sort(unique(vcu_df$series))
+  # Environmental outcome plot
+  env_df <- long_res |> filter(outcome == "env_outcome")
+  env_series_all <- sort(unique(env_df$series))
   if (multi_arm) {
     trt_arms <- setdiff(config$arms, "control")
-    itt_order_v <- paste("ITT", trt_arms, "VCU", sep = " - ")
-    tot_order_v <- paste("TOT", trt_arms, "VCU", sep = " - ")
-    vcu_order <- c(itt_order_v, tot_order_v)
-    vcu_order <- vcu_order[vcu_order %in% vcu_series_all]
-    vcu_cols_vec <- get_palette(length(vcu_order), "Set1")
-    vcu_cols <- setNames(vcu_cols_vec, vcu_order)
-    vcu_labels <- c(paste0("ITT: ", trt_arms, " - VCU"),
-                    paste0("TOT: ", trt_arms, " - VCU"))
-    lab_map_v <- setNames(vcu_labels, c(itt_order_v, tot_order_v))
-    vcu_labels_final <- lab_map_v[vcu_order]
-    vcu_scale <- scale_color_manual(
-      values = vcu_cols,
-      breaks = vcu_order,
-      labels = vcu_labels_final,
+  # Series keys must match what's in data: we used outcome tokens (env_outcome)
+  itt_order_v <- paste("ITT", trt_arms, "env_outcome", sep = " - ")
+  tot_order_v <- paste("TOT", trt_arms, "env_outcome", sep = " - ")
+    env_order <- c(itt_order_v, tot_order_v)
+    env_order <- env_order[env_order %in% env_series_all]
+    env_cols_vec <- get_palette(length(env_order), "Set1")
+    env_cols <- setNames(env_cols_vec, env_order)
+  env_labels <- c(paste0("ITT: ", trt_arms, " - Environmental"),
+          paste0("TOT: ", trt_arms, " - Environmental"))
+    lab_map_v <- setNames(env_labels, c(itt_order_v, tot_order_v))
+    env_labels_final <- lab_map_v[env_order]
+    env_scale <- scale_color_manual(
+      values = env_cols,
+      breaks = env_order,
+      labels = env_labels_final,
       guide = guide_legend(nrow = 1, byrow = TRUE, direction = "horizontal", label.position = "right")
     )
   } else {
-    vcu_order <- vcu_series_all
-    vcu_cols <- setNames(get_palette(length(vcu_order), "Set1"), vcu_order)
-    vcu_labels_final <- sub("^(ITT) - (VCU)$", "ITT: VCU", vcu_order)
-    vcu_labels_final <- sub("^(TOT) - (VCU)$", "TOT: VCU", vcu_labels_final)
-    vcu_labels_final <- sub("^(ITT) - ([^-]+) - VCU$", "ITT: \2 - VCU", vcu_labels_final)
-    vcu_labels_final <- sub("^(TOT) - ([^-]+) - VCU$", "TOT: \2 - VCU", vcu_labels_final)
-    vcu_scale <- scale_color_manual(
-      values = vcu_cols,
-      breaks = vcu_order,
-      labels = vcu_labels_final,
+    env_order <- env_series_all
+    env_cols <- setNames(get_palette(length(env_order), "Set1"), env_order)
+    env_labels_final <- sub("^(ITT) - (Environmental)$", "ITT: Environmental", env_order)
+    env_labels_final <- sub("^(TOT) - (Environmental)$", "TOT: Environmental", env_labels_final)
+    env_labels_final <- sub("^(ITT) - ([^-]+) - Environmental$", "ITT: \\2 - Environmental", env_labels_final)
+    env_labels_final <- sub("^(TOT) - ([^-]+) - Environmental$", "TOT: \\2 - Environmental", env_labels_final)
+    env_scale <- scale_color_manual(
+      values = env_cols,
+      breaks = env_order,
+      labels = env_labels_final,
       guide = guide_legend(direction = "horizontal", label.position = "right")
     )
   }
-  plt_vcu <- ggplot(vcu_df, aes(x = sweep_value, y = power, group = series, color = series)) +
-    geom_line(size = 0.7) +
-    geom_point(size = 2.2) +
+  env_df <- env_df |> filter(!is.na(arm)) |> mutate(group_id = interaction(estimator, arm, drop = TRUE))
+  plt_env <- ggplot(env_df, aes(x = sweep_value, y = power,
+                                group = group_id,
+                                color = estimator, linetype = estimator)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 2.0, show.legend = FALSE) +
     geom_hline(yintercept = 0.8, linetype = "dashed", color = "#666666") +
-    vcu_scale +
+    scale_color_manual(values = c(ITT = "#1b9e77", TOT = "#d95f02"), name = NULL) +
+    scale_linetype_manual(values = c(ITT = "solid", TOT = "dashed"), name = NULL) +
+    guides(color = guide_legend(order = 1), linetype = guide_legend(order = 1)) +
     scale_x_continuous(breaks = unique(results$sweep_value)) +
     scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1), expand = c(0, 0)) +
     labs(
       x = sweep_param,
       y = "Power",
-  title = glue::glue("Power vs {sweep_param} (VCU){if (multi_arm) ' by Arm' else ''}"),
-  subtitle = glue::glue("Design: {unique(results$experiment_type)}"),
+      title = glue::glue("Power vs {sweep_param} (Environmental){if (multi_arm) ' by Arm' else ''}"),
+      subtitle = glue::glue("Design: {unique(results$experiment_type)}"),
       caption = caption_text
     ) + base_theme
 
+  # ---------------- Combined (both outcomes) plot ---------------- #
+  combined_df <- long_res |> filter(!is.na(arm)) |> mutate(group_id = interaction(outcome, estimator, arm, drop = TRUE))
+  combined_title <- glue::glue("Power vs {sweep_param} (Socio-economic & Environmental){if (multi_arm) ' by Arm' else ''}")
+  combined_df$outcome <- factor(combined_df$outcome, levels = c("soc_outcome","env_outcome"))
+  outcome_colors <- c(soc_outcome = "#1b9e77", env_outcome = "#7570b3")
+  plt_combined <- ggplot(combined_df, aes(x = sweep_value, y = power,
+                                          group = group_id,
+                                          color = outcome, linetype = estimator)) +
+    geom_line(linewidth = 0.7) +
+    geom_point(size = 2.0, show.legend = FALSE) +
+    geom_hline(yintercept = 0.8, linetype = "dashed", color = "#666666") +
+    scale_color_manual(values = outcome_colors, labels = c(soc_outcome = "Socio-economic", env_outcome = "Environmental"), name = "Outcome") +
+    scale_linetype_manual(values = c(ITT = "solid", TOT = "dashed"), name = "Estimator") +
+    scale_x_continuous(breaks = unique(results$sweep_value)) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1), expand = c(0,0)) +
+    labs(x = sweep_param, y = "Power", title = combined_title,
+         subtitle = glue::glue("Design: {unique(results$experiment_type)}"),
+         caption = caption_text) +
+    guides(color = guide_legend(order = 1), linetype = guide_legend(order = 2)) +
+    base_theme
+  if (multi_arm) {
+    plt_combined <- plt_combined + facet_wrap(~arm)
+  }
+
   # File paths for separate plots
-  part_png  <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_participation.png"))
-  part_pdf  <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_participation.pdf"))
-  vcu_png   <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_VCU.png"))
-  vcu_pdf   <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_VCU.pdf"))
+  part_png  <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_soc_outcome.png"))
+  part_pdf  <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_soc_outcome.pdf"))
+  env_png   <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_env_outcome.png"))
+  env_pdf   <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_env_outcome.pdf"))
+  combined_png <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_combined.png"))
+  combined_pdf <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_combined.pdf"))
 
   ggsave(part_png,  plt_part, width = 8, height = 5, dpi = 300)
   ggsave(part_pdf,  plt_part, width = 8, height = 5)
-  ggsave(vcu_png,   plt_vcu,  width = 8, height = 5, dpi = 300)
-  ggsave(vcu_pdf,   plt_vcu,  width = 8, height = 5)
+  ggsave(env_png,   plt_env,  width = 8, height = 5, dpi = 300)
+  ggsave(env_pdf,   plt_env,  width = 8, height = 5)
+  ggsave(combined_png, plt_combined, width = if (multi_arm) 10 else 8, height = 5, dpi = 300)
+  ggsave(combined_pdf, plt_combined, width = if (multi_arm) 10 else 8, height = 5)
   message("Exported results to:\n", csv_path, "\n", long_csv_path, "\n",
-    part_png, "\n", part_pdf, "\n", vcu_png,  "\n", vcu_pdf)
+  part_png, "\n", part_pdf, "\n", env_png,  "\n", env_pdf, "\n", combined_png, "\n", combined_pdf, "\n",
+    last_data_csv)
 
   list(results = results,
-       csv = csv_path,
-       participation_png = part_png,
-       participation_pdf = part_pdf,
-       VCU_png = vcu_png,
-       VCU_pdf = vcu_pdf,
-       plot_participation = plt_part,
-    plot_VCU = plt_vcu,
+    csv = csv_path,
+    last_sim_data_csv = last_data_csv,
+    # Preferred names
+    soc_outcome_png = part_png,
+    soc_outcome_pdf = part_pdf,
+    env_outcome_png = env_png,
+    env_outcome_pdf = env_pdf,
+  combined_png = combined_png,
+  combined_pdf = combined_pdf,
+  plot_combined = plt_combined,
+    plot_soc_outcome = plt_part,
+    plot_env_outcome = plt_env,
     long_table = long_table,
-    long_csv = long_csv_path)
+    long_csv = long_csv_path,
+    # Backward compatibility aliases (kept minimal; removed VCU-specific aliases)
+    outcome_png = part_png,
+    outcome_pdf = part_pdf,
+    participation_png = part_png,
+    participation_pdf = part_pdf,
+    plot_outcome = plt_part,
+    plot_participation = plt_part)
 }
