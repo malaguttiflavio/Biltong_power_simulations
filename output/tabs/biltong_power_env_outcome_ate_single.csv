@@ -1,0 +1,7 @@
+arm_soc_outcome_ate_pct_T1,sweep_param,sweep_value,experiment_type,outcome_dist,power_ITT_soc_outcome_T1,power_TOT_soc_outcome_T1,power_ITT_env_outcome_T1,power_TOT_env_outcome_T1,power_ITT_soc_outcome,power_TOT_soc_outcome,power_ITT_env_outcome,power_TOT_env_outcome,power_ITT_outcome,power_TOT_outcome,arm_env_outcome_ate_T1,swept_arm
+1.05,env_outcome_ate_single,5,community_level,negbin,0.6966666666666667,0.7033333333333334,1,1,0.6966666666666667,0.7033333333333334,1,1,0.6966666666666667,0.7033333333333334,5,T1
+1.05,env_outcome_ate_single,10,community_level,negbin,0.6633333333333333,0.67,1,1,0.6633333333333333,0.67,1,1,0.6633333333333333,0.67,10,T1
+1.05,env_outcome_ate_single,15,community_level,negbin,0.68,0.68,1,1,0.68,0.68,1,1,0.68,0.68,15,T1
+1.05,env_outcome_ate_single,20,community_level,negbin,0.6966666666666667,0.7033333333333334,1,1,0.6966666666666667,0.7033333333333334,1,1,0.6966666666666667,0.7033333333333334,20,T1
+1.05,env_outcome_ate_single,25,community_level,negbin,0.7566666666666667,0.76,1,1,0.7566666666666667,0.76,1,1,0.7566666666666667,0.76,25,T1
+1.05,env_outcome_ate_single,30,community_level,negbin,0.7033333333333334,0.7033333333333334,1,1,0.7033333333333334,0.7033333333333334,1,1,0.7033333333333334,0.7033333333333334,30,T1

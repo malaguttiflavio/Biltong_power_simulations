@@ -2,21 +2,21 @@
 
 # Parallelized using {furrr} for multicore processing
 # Uses 14 cores based on MacBook Pro M4 Pro
-# Supports multi-arm designs: arms[1] is control; per-arm effects via ate_pct (formerly avg_treatment_effect_pct) and env_outcome_delta_mean
+# Supports multi-arm designs: arms[1] is control; per-arm effects via soc_outcome_ate_pct_* and env_outcome_ate_*
 simulate_power <- function(
   config,
   sweep_param = c(
     # generic
-    "ate_pct","n_communities","avg_ind_obs_per_comm","alloc_ratio",
+  "n_communities","avg_ind_obs_per_comm","alloc_ratio",
     # canonical soc/env names
-  "soc_outcome_T","soc_outcome_ICC","soc_outcome_AR1_rho","soc_outcome_AR1_var",
-  "env_outcome_T","env_outcome_ICC","env_outcome_AR1_rho","env_outcome_AR1_var",
-    # legacy aliases (mapped internally)
-    "T_outcome","ICC_outcome","AR1_outcome"
+    "soc_outcome_T","soc_outcome_ICC","soc_outcome_AR1_rho","soc_outcome_AR1_var",
+    "env_outcome_T","env_outcome_ICC","env_outcome_AR1_rho","env_outcome_AR1_var",
+    # convenience aliases from master script
+    "soc_outcome_ate_pct_single","env_outcome_ate_single"
   ),
   sweep_arm = NULL,
   sweep_values = NULL,
-  sweep_each_arm = FALSE,  # when TRUE and sweep_param is arm-level (e.g. ate_pct), run an independent sweep for each treatment arm
+  sweep_each_arm = FALSE,  # when TRUE and sweep_param is arm-level (e.g. soc_outcome_ate_pct_*), run an independent sweep for each treatment arm
   parallel_layer = c("inner","outer","both","none"), # choose which layer to parallelize
   outfile_stem = "biltong_power",
   seed = 1
@@ -41,14 +41,6 @@ simulate_power <- function(
     cols
   }
   sweep_param <- match.arg(sweep_param)
-  # Map legacy sweep_param values to canonical internal names
-  sweep_param <- switch(
-    sweep_param,
-    T_outcome = "soc_outcome_T",
-    ICC_outcome = "soc_outcome_ICC",
-    AR1_outcome = "soc_outcome_AR1_rho",
-    sweep_param
-  )
   # ---------------------- Basic multi-arm validation & normalization ---------------------- #
   normalize_config <- function(cfg) {
     # Ensure arms include control as first element
@@ -130,71 +122,31 @@ simulate_power <- function(
       }
     }
 
-    # ate_pct (formerly avg_treatment_effect_pct): multiplicative (>0); only for treatment arms; default 1
-    if (!is.null(cfg$avg_treatment_effect_pct) && is.null(cfg$ate_pct)) {
-      cfg$ate_pct <- cfg$avg_treatment_effect_pct
-      message("[compat] Mapped deprecated 'avg_treatment_effect_pct' to 'ate_pct'.")
-      cfg$avg_treatment_effect_pct <- NULL
-    }
-    if (is.null(cfg$ate_pct)) {
-      cfg$ate_pct <- setNames(rep(1, length(treatment_arms)), treatment_arms)
+    # Use only soc_* and env_* names; legacy aliasing removed
+    # Ensure environmental ATE present under current names; default to zeros per treatment arm
+    if (is.null(cfg$env_outcome_ate_single) && is.null(cfg$env_outcome_ate_multi)) {
+      cfg$env_outcome_ate_single <- setNames(rep(0, length(treatment_arms)), treatment_arms)
     } else {
-      if (is.null(names(cfg$ate_pct)) && length(cfg$ate_pct) == 1 && length(treatment_arms) == 1) {
-        cfg$ate_pct <- setNames(cfg$ate_pct, treatment_arms)
+      # Normalize any provided container to be named and exclude control
+      if (!is.null(cfg$env_outcome_ate_single)) {
+        if (is.null(names(cfg$env_outcome_ate_single)) && length(cfg$env_outcome_ate_single) == 1 && length(treatment_arms) == 1) {
+          cfg$env_outcome_ate_single <- setNames(cfg$env_outcome_ate_single, treatment_arms)
+        }
+        missing_vdm <- setdiff(treatment_arms, names(cfg$env_outcome_ate_single))
+        if (length(missing_vdm) > 0) cfg$env_outcome_ate_single <- c(cfg$env_outcome_ate_single, setNames(rep(0, length(missing_vdm)), missing_vdm))
+        cfg$env_outcome_ate_single <- cfg$env_outcome_ate_single[setdiff(names(cfg$env_outcome_ate_single), "control")]
       }
-      if (is.null(names(cfg$ate_pct))) stop("ate_pct must be a named vector with treatment arm names (omit 'control')")
-      missing_ate <- setdiff(treatment_arms, names(cfg$ate_pct))
-      if (length(missing_ate) > 0) {
-        cfg$ate_pct <- c(cfg$ate_pct, setNames(rep(1, length(missing_ate)), missing_ate))
+      if (!is.null(cfg$env_outcome_ate_multi)) {
+        if (is.null(names(cfg$env_outcome_ate_multi)) && length(cfg$env_outcome_ate_multi) == 1 && length(treatment_arms) == 1) {
+          cfg$env_outcome_ate_multi <- setNames(cfg$env_outcome_ate_multi, treatment_arms)
+        }
+        missing_vdm2 <- setdiff(treatment_arms, names(cfg$env_outcome_ate_multi))
+        if (length(missing_vdm2) > 0) cfg$env_outcome_ate_multi <- c(cfg$env_outcome_ate_multi, setNames(rep(0, length(missing_vdm2)), missing_vdm2))
+        cfg$env_outcome_ate_multi <- cfg$env_outcome_ate_multi[setdiff(names(cfg$env_outcome_ate_multi), "control")]
       }
-      cfg$ate_pct <- cfg$ate_pct[setdiff(names(cfg$ate_pct), "control")]
     }
 
-    # -------------------- Canonical key mapping (consistency) -------------------- #
-    # Map legacy 'outcome_*' to canonical 'soc_outcome_*'
-    if (!is.null(cfg$outcome_dist)       && is.null(cfg$soc_outcome_dist))       cfg$soc_outcome_dist <- cfg$outcome_dist
-    if (!is.null(cfg$outcome_base_mean)  && is.null(cfg$soc_outcome_base_mean))  cfg$soc_outcome_base_mean <- cfg$outcome_base_mean
-    if (!is.null(cfg$theta_outcome)      && is.null(cfg$soc_outcome_theta))      cfg$soc_outcome_theta <- cfg$theta_outcome
-    if (!is.null(cfg$ICC_outcome)        && is.null(cfg$soc_outcome_ICC))        cfg$soc_outcome_ICC <- cfg$ICC_outcome
-  # Accept legacy AR1_outcome or AR1_outcome_rho as aliases
-  if (!is.null(cfg$AR1_outcome_rho)        && is.null(cfg$soc_outcome_AR1_rho))        cfg$soc_outcome_AR1_rho <- cfg$AR1_outcome_rho
-  if (!is.null(cfg$AR1_outcome)            && is.null(cfg$soc_outcome_AR1_rho))        cfg$soc_outcome_AR1_rho <- cfg$AR1_outcome
-  # Map old canonical soc_outcome_AR1 to new soc_outcome_AR1_rho
-  if (!is.null(cfg$soc_outcome_AR1)        && is.null(cfg$soc_outcome_AR1_rho))        cfg$soc_outcome_AR1_rho <- cfg$soc_outcome_AR1
-    if (!is.null(cfg$T_outcome)          && is.null(cfg$soc_outcome_T))          cfg$soc_outcome_T <- cfg$T_outcome
-    if (!is.null(cfg$months_outcome)     && is.null(cfg$soc_outcome_T_months))     cfg$soc_outcome_T_months <- cfg$months_outcome
-
-    # Map old canonical env_outcome_AR1 to new env_outcome_AR1_rho
-    if (!is.null(cfg$env_outcome_AR1)        && is.null(cfg$env_outcome_AR1_rho))        cfg$env_outcome_AR1_rho <- cfg$env_outcome_AR1
-    if (is.null(cfg$env_outcome_delta_mean)) {
-      cfg$env_outcome_delta_mean <- setNames(rep(0, length(treatment_arms)), treatment_arms)
-    } else {
-      if (is.null(names(cfg$env_outcome_delta_mean)) && length(cfg$env_outcome_delta_mean) == 1 && length(treatment_arms) == 1) {
-        cfg$env_outcome_delta_mean <- setNames(cfg$env_outcome_delta_mean, treatment_arms)
-      }
-      if (is.null(names(cfg$env_outcome_delta_mean))) stop("env_outcome_delta_mean must be a named vector with treatment arm names (omit 'control')")
-      missing_vdm <- setdiff(treatment_arms, names(cfg$env_outcome_delta_mean))
-      if (length(missing_vdm) > 0) {
-        cfg$env_outcome_delta_mean <- c(cfg$env_outcome_delta_mean, setNames(rep(0, length(missing_vdm)), missing_vdm))
-      }
-      cfg$env_outcome_delta_mean <- cfg$env_outcome_delta_mean[setdiff(names(cfg$env_outcome_delta_mean), "control")]
-    }
-
-    # Drop legacy keys to avoid accidental use downstream
-  cfg$VCU_delta_mean <- NULL
-    cfg$outcome_dist <- NULL
-    cfg$outcome_base_mean <- NULL
-    cfg$theta_outcome <- NULL
-    cfg$ICC_outcome <- NULL
-    cfg$AR1_outcome <- NULL
-    cfg$T_outcome <- NULL
-    cfg$months_outcome <- NULL
-  cfg$VCU_base_mean <- NULL
-  cfg$VCU_base_sd <- NULL
-  cfg$ICC_VCU <- NULL
-  cfg$AR1_VCU <- NULL
-  cfg$T_VCU <- NULL
-  cfg$months_VCU <- NULL
+    # Legacy/VCU keys no longer supported and not referenced
 
     # Defaults for strata treatment-effect heterogeneity (variances default to 0 = no extra heterogeneity)
     if (is.null(cfg$year_in_program_ate))      cfg$year_in_program_ate <- NULL  # vector or named values per level; optional
@@ -203,6 +155,11 @@ simulate_power <- function(
     if (is.null(cfg$year_in_program_ate_var))  cfg$year_in_program_ate_var <- 0
     if (is.null(cfg$ngo_id_ate_var))           cfg$ngo_id_ate_var <- 0
     if (is.null(cfg$tribe_id_ate_var))         cfg$tribe_id_ate_var <- 0
+
+  # Cluster FE flag: use 'cluster_fe_yn' exclusively
+
+  # Optional diagnostics toggle (prints/writes per-stratum arm counts and TE draws for last run)
+  if (is.null(cfg$print_strata_diag)) cfg$print_strata_diag <- FALSE
 
     cfg
   }
@@ -306,6 +263,22 @@ simulate_power <- function(
     }
 
     list(comm = comm, df_soc = df_soc, df_env = df_env)
+  }
+
+  # Helpers to retrieve per-arm effects using config variable names directly
+  get_soc_ate_pct <- function(cfgx) {
+    # Prefer scenario-specific names; fallback to canonical if present
+    if (!is.null(cfgx$soc_outcome_ate_pct_single)) return(cfgx$soc_outcome_ate_pct_single)
+    if (!is.null(cfgx$soc_outcome_ate_pct_multi))  return(cfgx$soc_outcome_ate_pct_multi)
+    NULL
+  }
+  get_env_add <- function(cfgx) {
+    if (!is.null(cfgx$env_outcome_ate_single)) return(cfgx$env_outcome_ate_single)
+    if (!is.null(cfgx$env_outcome_ate_multi))  return(cfgx$env_outcome_ate_multi)
+    # Fallback default: zeros per treatment arm if neither provided
+    trt_arms <- setdiff(cfgx$arms %||% character(), "control")
+    if (length(trt_arms) > 0) return(setNames(rep(0, length(trt_arms)), trt_arms))
+    NULL
   }
 
   # Helper: assign arms within strata for balanced randomization
@@ -429,6 +402,24 @@ simulate_power <- function(
                    as.numeric(ngo_map[as.character(smp$comm$ngo_id)]) +
                    as.numeric(tri_map[as.character(smp$comm$tribe_id)])
     )
+    # Optional diagnostics: per-stratum arm counts and realized TE draws
+    diag_strata_counts <- NULL
+    diag_te_draws <- NULL
+    if (isTRUE(config_run$print_strata_diag)) {
+      if (!is.null(config_run$stratify_by) && length(config_run$stratify_by) > 0) {
+        tmp_comm <- smp$comm |> left_join(arm_comm, by = "community_id")
+        grp_vars <- c(config_run$stratify_by, "arm")
+        diag_strata_counts <- tmp_comm |>
+          group_by(across(all_of(grp_vars))) |>
+          summarize(n = n(), .groups = "drop") |>
+          arrange(across(all_of(config_run$stratify_by)), arm)
+      }
+      diag_te_draws <- bind_rows(
+        tibble(variable = "year_in_program", level = names(yr_map), effect = as.numeric(yr_map)),
+        tibble(variable = "ngo_id",          level = names(ngo_map), effect = as.numeric(ngo_map)),
+        tibble(variable = "tribe_id",        level = names(tri_map), effect = as.numeric(tri_map))
+      )
+    }
 
     if (config_run$experiment_type == "community_level") {
       df_soc <- smp$df_soc |> left_join(arm_comm, by = "community_id")
@@ -484,8 +475,8 @@ simulate_power <- function(
         ungroup()
 
       log_mu_base <- log(pmax(config_run$soc_outcome_base_mean, 1e-6)) + df_soc$u_comm_p + df_soc$e_ar
-      # Per-arm multiplicative effects, realized only when D==1
-  mrr  <- config_run$ate_pct
+    # Per-arm multiplicative effects, realized only when D==1
+  mrr  <- get_soc_ate_pct(config_run)
       mult <- rep(1, nrow(df_soc))
       if (!is.null(mrr)) for (nm in names(mrr)) mult[df_soc$arm == nm] <- mult[df_soc$arm == nm] * mrr[[nm]]
   log_mu <- log_mu_base + log(mult) * df_soc$D + df_soc$tau_strata * df_soc$D
@@ -511,7 +502,7 @@ simulate_power <- function(
         ungroup()
 
       log_mu_base <- log(pmax(config_run$soc_outcome_base_mean, 1e-6)) + df_soc$u_comm_p + df_soc$e_ar
-  mrr  <- config_run$ate_pct
+  mrr  <- get_soc_ate_pct(config_run)
       mult <- rep(1, nrow(df_soc))
       if (!is.null(mrr)) for (nm in names(mrr)) mult[df_soc$arm == nm] <- mult[df_soc$arm == nm] * mrr[[nm]]
   log_mu <- log_mu_base + log(mult) * df_soc$D + df_soc$tau_strata * df_soc$D
@@ -612,7 +603,7 @@ simulate_power <- function(
   if (!"D" %in% names(df_env)) stop("Column D missing in df_env after compliance")
   df_env$arm <- factor(df_env$arm, levels = config_run$arms)
 
-  vdm <- config_run$env_outcome_delta_mean
+  vdm <- get_env_add(config_run)
     add <- rep(0, nrow(df_env))
     if (!is.null(vdm)) for (nm in names(vdm)) add[df_env$arm == nm] <- add[df_env$arm == nm] + vdm[[nm]]
   df_env$Y <- config_run$env_outcome_base_mean + df_env$u_comm_v + df_env$e_ar + add * df_env$D + df_env$tau_strata * df_env$D
@@ -689,6 +680,8 @@ simulate_power <- function(
     if (isTRUE(capture_data)) {
       out_list$last_df_soc <- df_soc
       out_list$last_df_env <- df_env
+      if (!is.null(diag_strata_counts)) out_list$diag_strata_counts <- diag_strata_counts
+      if (!is.null(diag_te_draws)) out_list$diag_te_draws <- diag_te_draws
     }
     out_list
   }
@@ -696,22 +689,52 @@ simulate_power <- function(
   # Run sims for a given sweep value; override_arm allows independent sweeps per treatment arm
   run_for_value <- function(val, override_arm = NULL) {
     config_sweep <- config
-  if (sweep_param == "ate_pct") {
+    # Socio-economic ATE sweep: use config-native names only
+    if (sweep_param %in% c("soc_outcome_ate_pct_single","soc_outcome_ate_pct_multi")) {
+      # Choose which container to update based on presence/preference
+      mrr_container <- if (!is.null(config_sweep$soc_outcome_ate_pct_single) || sweep_param == "soc_outcome_ate_pct_single") {
+        "soc_outcome_ate_pct_single"
+      } else if (!is.null(config_sweep$soc_outcome_ate_pct_multi) || sweep_param == "soc_outcome_ate_pct_multi") {
+        "soc_outcome_ate_pct_multi"
+      } else stop("soc_outcome_ate_pct_* must be defined in config")
       local_arm <- if (!is.null(override_arm)) override_arm else sweep_arm
       if (!is.null(local_arm)) {
-        if (is.null(config_sweep$ate_pct)) stop("ate_pct must be defined in config")
-        config_sweep$ate_pct[[local_arm]] <- val
+        if (is.null(config_sweep[[mrr_container]])) stop(mrr_container, " must be defined in config")
+        config_sweep[[mrr_container]][[local_arm]] <- val
       } else {
         # If a scalar val provided without specifying arm, recycle across all treatment arms
         treatment_arms <- setdiff(config_sweep$arms, "control")
         if (length(val) == 1 && is.null(names(val))) {
-          config_sweep$ate_pct <- setNames(rep(val, length(treatment_arms)), treatment_arms)
+          config_sweep[[mrr_container]] <- setNames(rep(val, length(treatment_arms)), treatment_arms)
         } else {
           # Expect a named vector; validate names
-            if (is.null(names(val))) stop("When providing multiple ate_pct values, they must be named by treatment arms")
-            missing_names <- setdiff(treatment_arms, names(val))
-            if (length(missing_names) > 0) stop("ate_pct sweep value missing names for: ", paste(missing_names, collapse=","))
-            config_sweep$ate_pct <- val[treatment_arms]
+          if (is.null(names(val))) stop("When providing multiple ", mrr_container, " values, they must be named by treatment arms")
+          missing_names <- setdiff(treatment_arms, names(val))
+          if (length(missing_names) > 0) stop(mrr_container, " sweep value missing names for: ", paste(missing_names, collapse=","))
+          config_sweep[[mrr_container]] <- val[treatment_arms]
+        }
+      }
+    }
+    # Environmental ATE sweep: support config-native names and canonical
+    if (sweep_param %in% c("env_outcome_ate_single","env_outcome_ate_multi")) {
+      vdm_container <- if (!is.null(config_sweep$env_outcome_ate_single) || sweep_param == "env_outcome_ate_single") {
+        "env_outcome_ate_single"
+      } else if (!is.null(config_sweep$env_outcome_ate_multi) || sweep_param == "env_outcome_ate_multi") {
+        "env_outcome_ate_multi"
+      } else stop("env_outcome_ate_* must be defined in config")
+      local_arm <- if (!is.null(override_arm)) override_arm else sweep_arm
+      if (!is.null(local_arm)) {
+        if (is.null(config_sweep[[vdm_container]])) stop(vdm_container, " must be defined in config")
+        config_sweep[[vdm_container]][[local_arm]] <- val
+      } else {
+        treatment_arms <- setdiff(config_sweep$arms, "control")
+        if (length(val) == 1 && is.null(names(val))) {
+          config_sweep[[vdm_container]] <- setNames(rep(val, length(treatment_arms)), treatment_arms)
+        } else {
+          if (is.null(names(val))) stop("When providing multiple ", vdm_container, " values, they must be named by treatment arms")
+          missing_names <- setdiff(treatment_arms, names(val))
+          if (length(missing_names) > 0) stop(vdm_container, " sweep value missing names for: ", paste(missing_names, collapse=","))
+          config_sweep[[vdm_container]] <- val[treatment_arms]
         }
       }
     }
@@ -762,12 +785,12 @@ simulate_power <- function(
     # ---------------- Add per-arm effect size columns to output ---------------- #
     trt_arms <- setdiff(config_sweep$arms, "control")
     # Meeting rate ratios (multiplicative)
-  mrr_vals <- config_sweep$ate_pct
+    mrr_vals <- get_soc_ate_pct(config_sweep)
     if (length(mrr_vals) == 0 && length(trt_arms) > 0) {
       mrr_vals <- setNames(rep(1, length(trt_arms)), trt_arms)
     }
-  # Environmental additive effects
-  vdm_vals <- config_sweep$env_outcome_delta_mean
+    # Environmental additive effects
+    vdm_vals <- get_env_add(config_sweep)
     if (length(vdm_vals) == 0 && length(trt_arms) > 0) {
       vdm_vals <- setNames(rep(0, length(trt_arms)), trt_arms)
     }
@@ -791,10 +814,10 @@ simulate_power <- function(
   out_row$power_ITT_outcome <- out_row$power_ITT_soc_outcome
   out_row$power_TOT_outcome <- out_row$power_TOT_soc_outcome
     }
-    # Append effect size columns explicitly (renamed: arm_ate_pct_*)
+    # Append effect size columns explicitly (renamed: arm_soc_outcome_ate_pct_*)
     for (a in trt_arms) {
-      col_mrr <- paste0("arm_ate_pct_", a)
-      col_vdm_new <- paste0("arm_env_outcome_delta_mean_", a)
+      col_mrr <- paste0("arm_soc_outcome_ate_pct_", a)
+  col_vdm_new <- paste0("arm_env_outcome_ate_", a)
       out_row[[col_mrr]]    <- unname(mrr_vals[a])
       out_row[[col_vdm_new]] <- unname(vdm_vals[a])
     }
@@ -803,8 +826,8 @@ simulate_power <- function(
   }
 
   # Run across sweep with progress bar
-  if (sweep_each_arm && sweep_param != "ate_pct") {
-    warning("sweep_each_arm currently only implemented for sweep_param = 'ate_pct'; ignoring flag.")
+  if (sweep_each_arm && !(sweep_param %in% c("soc_outcome_ate_pct_single","soc_outcome_ate_pct_multi","env_outcome_ate_single","env_outcome_ate_multi"))) {
+    warning("sweep_each_arm currently only implemented for sweep_param in {'soc_outcome_ate_pct_single','soc_outcome_ate_pct_multi','env_outcome_ate_single','env_outcome_ate_multi'}; ignoring flag.")
     sweep_each_arm <- FALSE
   }
 
@@ -846,10 +869,11 @@ simulate_power <- function(
       results <- map_dfr(sweep_values, run_for_value)
     }
   }
+  # Note: env_outcome_ate_* sweep handling occurs inside run_for_value; no additional handling needed here.
 
-  # Reorder: place arm_ate_pct_* columns first (user request)
-  effect_ate_cols <- grep("^arm_ate_pct_", names(results), value = TRUE)
-  preferred_order <- c("arm_ate_pct_T1", "arm_ate_pct_T2")
+  # Reorder: place arm_soc_outcome_ate_pct_* columns first (user request)
+  effect_ate_cols <- grep("^arm_soc_outcome_ate_pct_", names(results), value = TRUE)
+  preferred_order <- c("arm_soc_outcome_ate_pct_T1", "arm_soc_outcome_ate_pct_T2")
   effect_ate_cols <- unique(c(preferred_order[preferred_order %in% effect_ate_cols], setdiff(effect_ate_cols, preferred_order)))
   if (length(effect_ate_cols) > 0) {
     remaining <- setdiff(names(results), effect_ate_cols)
@@ -869,17 +893,6 @@ simulate_power <- function(
   write_csv(results, csv_path)
 
   # Figure
-  alloc_caption <- if (!is.null(config$alloc_ratios)) {
-    paste0("alloc={", paste(names(config$alloc_ratios), config$alloc_ratios, sep=":", collapse=", "), "}")
-  } else {
-    paste0("alloc_ratio=", config$alloc_ratio)
-  }
-  takeup_caption <- if (!is.null(config$take_up)) {
-    paste0("take_up={", paste(names(config$take_up), config$take_up, sep=":", collapse=", "), "}")
-  } else {
-    "take_up not set"
-  }
-
   # Reshape for plotting; handle per-arm columns
   long_res <- results |>
     pivot_longer(
@@ -914,7 +927,7 @@ simulate_power <- function(
     })
 
   # ---------------- Tidy long table (one row per arm x estimator x outcome x sweep value) --------------- #
-  # Keep only rows with a specific arm (avoid duplicated unsuffixed single-arm legacy columns)
+  # Keep only rows with a specific arm
   # Build selection vector safely (avoid non-standard evaluation error if swept_arm absent)
   base_cols <- c("sweep_param","sweep_value","arm","estimator","outcome","power")
   if ("swept_arm" %in% names(long_res)) base_cols <- c(base_cols, "swept_arm")
@@ -923,24 +936,24 @@ simulate_power <- function(
   if (sweep_each_arm && "swept_arm" %in% names(power_long)) {
     power_long <- power_long |> filter(arm == swept_arm)
   }
-  # Pivot effects for ate_pct, preserving swept_arm as an identifier if present
+  # Pivot effects for socio-economic ATE, preserving swept_arm as an identifier if present
   include_swept <- ("swept_arm" %in% names(results))
   id_cols <- c("sweep_value", if (include_swept) "swept_arm")
   effect_mrr_long <- results |>
-    select(all_of(c(id_cols)), starts_with("arm_ate_pct_")) |>
-    pivot_longer(cols = -all_of(id_cols), names_to = "effect_var", values_to = "arm_ate_pct") |>
-    mutate(arm = sub("^arm_ate_pct_", "", effect_var)) |>
+    select(all_of(c(id_cols)), starts_with("arm_soc_outcome_ate_pct_")) |>
+    pivot_longer(cols = -all_of(id_cols), names_to = "effect_var", values_to = "arm_soc_outcome_ate_pct") |>
+    mutate(arm = sub("^arm_soc_outcome_ate_pct_", "", effect_var)) |>
     select(-effect_var)
   effect_env_long <- results |>
-    select(all_of(c(id_cols)), starts_with("arm_env_outcome_delta_mean_")) |>
-    pivot_longer(cols = -all_of(id_cols), names_to = "effect_var", values_to = "arm_env_outcome_delta_mean") |>
-    mutate(arm = sub("^arm_env_outcome_delta_mean_", "", effect_var)) |>
+    select(all_of(c(id_cols)), starts_with("arm_env_outcome_ate_")) |>
+    pivot_longer(cols = -all_of(id_cols), names_to = "effect_var", values_to = "arm_env_outcome_ate") |>
+    mutate(arm = sub("^arm_env_outcome_ate_", "", effect_var)) |>
     select(-effect_var)
   effects_join <- full_join(effect_mrr_long, effect_env_long, by = c(id_cols, "arm"))
   long_table <- power_long |>
     left_join(effects_join, by = c(id_cols, "arm")) |>
     mutate(
-      scenario_ate_pct = sweep_value,
+      scenario_soc_outcome_ate_pct = sweep_value,
       is_swept = ifelse(!is.na(arm) & "swept_arm" %in% names(power_long), arm == swept_arm, TRUE)
     ) |>
     arrange(outcome, estimator, arm, sweep_value)
@@ -963,19 +976,22 @@ simulate_power <- function(
   last_val <- sweep_values[length(sweep_values)]
   config_last <- config
   # Apply the last sweep to config_last (mirror logic from run_for_value)
-  if (sweep_param == "ate_pct") {
+  if (sweep_param %in% c("soc_outcome_ate_pct_single","soc_outcome_ate_pct_multi")) {
     trt_arms_all <- setdiff(config_last$arms, "control")
+    mrr_container <- if (sweep_param == "soc_outcome_ate_pct_single" || !is.null(config_last$soc_outcome_ate_pct_single)) {
+      "soc_outcome_ate_pct_single"
+    } else if (sweep_param == "soc_outcome_ate_pct_multi" || !is.null(config_last$soc_outcome_ate_pct_multi)) {
+      "soc_outcome_ate_pct_multi"
+    } else stop("soc_outcome_ate_pct_* must be defined in config")
     if (sweep_each_arm) {
-      # Choose the last arm in declared order
       last_arm <- tail(trt_arms_all, 1)
-      if (is.null(config_last$ate_pct)) stop("ate_pct must be defined in config")
-      config_last$ate_pct[[last_arm]] <- last_val
+      if (is.null(config_last[[mrr_container]])) stop(mrr_container, " must be defined in config")
+      config_last[[mrr_container]][[last_arm]] <- last_val
     } else if (!is.null(sweep_arm)) {
-      if (is.null(config_last$ate_pct)) stop("ate_pct must be defined in config")
-      config_last$ate_pct[[sweep_arm]] <- last_val
+      if (is.null(config_last[[mrr_container]])) stop(mrr_container, " must be defined in config")
+      config_last[[mrr_container]][[sweep_arm]] <- last_val
     } else {
-      # Recycle value across all treatment arms
-      config_last$ate_pct <- setNames(rep(last_val, length(trt_arms_all)), trt_arms_all)
+      config_last[[mrr_container]] <- setNames(rep(last_val, length(trt_arms_all)), trt_arms_all)
     }
   }
   if (sweep_param == "n_communities")          config_last$n_communities        <- as.integer(last_val)
@@ -995,6 +1011,20 @@ simulate_power <- function(
   if (sweep_param == "soc_outcome_AR1_var")  config_last$soc_outcome_AR1_var <- last_val
   if (sweep_param == "env_outcome_AR1_var")  config_last$env_outcome_AR1_var <- last_val
   if (sweep_param == "alloc_ratio")          config_last$alloc_ratio <- last_val
+  if (sweep_param %in% c("env_outcome_ate_single","env_outcome_ate_multi")) {
+    trt_arms_all <- setdiff(config_last$arms, "control")
+    vdm_container <- if (sweep_param == "env_outcome_ate_single" || !is.null(config_last$env_outcome_ate_single)) {
+      "env_outcome_ate_single"
+    } else if (sweep_param == "env_outcome_ate_multi" || !is.null(config_last$env_outcome_ate_multi)) {
+      "env_outcome_ate_multi"
+    } else stop("env_outcome_ate_* must be defined in config")
+    if (!is.null(sweep_arm)) {
+      if (is.null(config_last[[vdm_container]])) stop(vdm_container, " must be defined in config")
+      config_last[[vdm_container]][[sweep_arm]] <- last_val
+    } else {
+      config_last[[vdm_container]] <- setNames(rep(last_val, length(trt_arms_all)), trt_arms_all)
+    }
+  }
 
   # Simulate one dataset with these settings and export
   last_run <- one_run(config_last, capture_data = TRUE)
@@ -1003,28 +1033,66 @@ simulate_power <- function(
   last_combined <- bind_rows(last_soc, last_env)
   last_data_csv <- file.path(tabs_dir, glue::glue("{outfile_stem}_{sweep_param}_last_sim_data.csv"))
   write_csv(last_combined, last_data_csv)
+  # Optional diagnostics export for the last run
+  last_diag_files <- list()
+  if (isTRUE(config$print_strata_diag)) {
+    if (!is.null(last_run$diag_strata_counts)) {
+      arm_counts_csv <- file.path(tabs_dir, glue::glue("{outfile_stem}_{sweep_param}_last_arm_counts.csv"))
+      write_csv(last_run$diag_strata_counts, arm_counts_csv)
+      last_diag_files$arm_counts_csv <- arm_counts_csv
+    }
+    if (!is.null(last_run$diag_te_draws)) {
+      te_draws_csv <- file.path(tabs_dir, glue::glue("{outfile_stem}_{sweep_param}_last_te_draws.csv"))
+      write_csv(last_run$diag_te_draws, te_draws_csv)
+      last_diag_files$te_draws_csv <- te_draws_csv
+    }
+  }
 
   base_theme <- theme_minimal(base_size = 12) +
     theme(
-      legend.position = "bottom",
-      legend.box = "horizontal",
+      legend.position  = "bottom",
+      legend.box       = "horizontal",
       legend.direction = "horizontal",
-      legend.title = element_blank(),
+      legend.title     = element_blank(),
       legend.key.width = unit(1.2, "cm"),
-      plot.title = element_text(face = "bold", size = 14),
-      plot.subtitle = element_text(size = 10),
-      axis.title = element_text(size = 11),
-      axis.text = element_text(size = 10),
+      plot.title       = element_text(face = "bold", size = 14),
+      plot.subtitle    = element_text(size = 10),
+      axis.title       = element_text(size = 11),
+      axis.text        = element_text(size = 10),
       panel.grid.minor = element_blank(),
-      plot.caption = element_text(hjust = 0, size = 8)
-    )
+      plot.caption     = element_text(hjust = 0, size = 8)
+      )
 
-  caption_text <- glue::glue(
-    "{alloc_caption}, n_communities={config$n_communities}, avg_ind_obs_per_comm={config$avg_ind_obs_per_comm}, soc_outcome_T={config$soc_outcome_T}, env_outcome_T={config$env_outcome_T};\n",
-    "year strata range={paste(range(config$year_in_program), collapse='-')}, NGOs up to 7, tribes up to 5, \n",
-    "alpha={config$alpha}, sims={config$sims}, seed={seed}, arms={paste(config$arms, collapse=',')}, {takeup_caption};\n",
-    "soc_outcome: dist={config$soc_outcome_dist}, theta={config$soc_outcome_theta}, base_mean={config$soc_outcome_base_mean}, ICC={config$soc_outcome_ICC}, AR1 Rho={config$soc_outcome_AR1_rho}, AR1_var={if (is.null(config$soc_outcome_AR1_var)) 1 else config$soc_outcome_AR1_var};\n",
-  "env_outcome: base_mean={config$env_outcome_base_mean}, base_sd={config$env_outcome_base_sd}, ICC={config$env_outcome_ICC}, AR1 Rho={config$env_outcome_AR1_rho}, AR1_var={if (is.null(config$env_outcome_AR1_var)) (config$env_outcome_base_sd^2) else config$env_outcome_AR1_var}; SE=Eicker-White {config$hc_type}; strata_ate_var: year={config$year_in_program_ate_var}, ngo={config$ngo_id_ate_var}, tribe={config$tribe_id_ate_var}"
+  # Helper formatters for readable caption text
+  percent_str <- function(x, accuracy = 1) scales::percent(x, accuracy = accuracy)
+  number_str <- function(x, accuracy = 0.1) scales::number(x, accuracy = accuracy, big.mark = ",")
+  format_named <- function(x, formatter, fallback = "not specified") {
+    if (is.null(x) || length(x) == 0) return(fallback)
+    if (is.null(names(x)) || any(names(x) == "")) names(x) <- paste0("V", seq_along(x))
+    paste(paste0(names(x), "=", formatter(x)), collapse = ", ")
+  }
+
+  soc_ar1_var   <- if (is.null(config$soc_outcome_AR1_var)) 1 else config$soc_outcome_AR1_var
+  env_ar1_var   <- if (is.null(config$env_outcome_AR1_var)) (config$env_outcome_base_sd^2) else config$env_outcome_AR1_var
+  strata_range  <- paste(range(config$year_in_program), collapse = " to ")
+  se_text <- if (isTRUE(config$cluster_se)) {
+    glue::glue("Cluster-robust ({config$hc_type})")
+  } else {
+    glue::glue("Eicker-White {config$hc_type}")
+  }
+
+  caption_text <- glue::glue_collapse(
+    c(
+      glue::glue("Arms: {paste(config$arms, collapse = ', ')}. Allocation: {format_named(config$alloc_ratios, function(v) percent_str(v, accuracy = 1))}"),
+      glue::glue("Design: {config$n_communities} communities; avg individuals={number_str(config$avg_ind_obs_per_comm, accuracy = 1)} (sd={number_str(config$sd_indiv_per_comm, accuracy = 1)})."),
+      glue::glue("Observations: Socio-economic T={config$soc_outcome_T} at months [{paste(config$soc_outcome_T_months, collapse = ', ')}]; Environmental T={config$env_outcome_T} at months [{paste(config$env_outcome_T_months, collapse = ', ')}]."),
+      glue::glue("Stratification: on year, NGO, and tribe with outcome distributions N(0, var: year={number_str(config$year_in_program_ate_var, accuracy = 0.1)}, NGO={number_str(config$ngo_id_ate_var, accuracy = 0.1)}, tribe={number_str(config$tribe_id_ate_var, accuracy = 0.1)})."),
+      glue::glue("Take-up (ITT vs. TOT): {format_named(config$take_up, function(v) percent_str(v, accuracy = 1))}"),
+      glue::glue("Soc outcome: dist={config$soc_outcome_dist}, theta={number_str(config$soc_outcome_theta, accuracy = 0.01)}, baseline={number_str(config$soc_outcome_base_mean, accuracy = 1)}, ICC={number_str(config$soc_outcome_ICC, accuracy = 0.001)}, AR1 rho={number_str(config$soc_outcome_AR1_rho, accuracy = 0.01)}, AR1 var={number_str(soc_ar1_var, accuracy = 0.01)}."),
+      glue::glue("Env outcome: baseline mean={number_str(config$env_outcome_base_mean, accuracy = 1)}, sd={number_str(config$env_outcome_base_sd, accuracy = 1)}, ICC={number_str(config$env_outcome_ICC, accuracy = 0.001)}, AR1 rho={number_str(config$env_outcome_AR1_rho, accuracy = 0.01)}, AR1 var={number_str(env_ar1_var, accuracy = 0.01)}."),
+      glue::glue("Inference: alpha={percent_str(config$alpha, accuracy = 1)}, sims={config$sims}, seed={seed}, SE={se_text}")
+    ),
+    sep = "\n"
   )
 
   # Socio-economic outcome plot
@@ -1147,59 +1215,31 @@ simulate_power <- function(
       caption = caption_text
     ) + base_theme
 
-  # ---------------- Combined (both outcomes) plot ---------------- #
-  combined_df <- long_res |> filter(!is.na(arm)) |> mutate(group_id = interaction(outcome, estimator, arm, drop = TRUE))
-  combined_title <- glue::glue("Power vs {sweep_param} (Socio-economic & Environmental){if (multi_arm) ' by Arm' else ''}")
-  combined_df$outcome <- factor(combined_df$outcome, levels = c("soc_outcome","env_outcome"))
-  outcome_colors <- c(soc_outcome = "#1b9e77", env_outcome = "#7570b3")
-  plt_combined <- ggplot(combined_df, aes(x = sweep_value, y = power,
-                                          group = group_id,
-                                          color = outcome, linetype = estimator)) +
-    geom_line(linewidth = 0.7) +
-    geom_point(size = 2.0, show.legend = FALSE) +
-    geom_hline(yintercept = 0.8, linetype = "dashed", color = "#666666") +
-    scale_color_manual(values = outcome_colors, labels = c(soc_outcome = "Socio-economic", env_outcome = "Environmental"), name = "Outcome") +
-    scale_linetype_manual(values = c(ITT = "solid", TOT = "dashed"), name = "Estimator") +
-    scale_x_continuous(breaks = unique(results$sweep_value)) +
-    scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1), expand = c(0,0)) +
-    labs(x = sweep_param, y = "Power", title = combined_title,
-         subtitle = glue::glue("Design: {unique(results$experiment_type)}"),
-         caption = caption_text) +
-    guides(color = guide_legend(order = 1), linetype = guide_legend(order = 2)) +
-    base_theme
-  if (multi_arm) {
-    plt_combined <- plt_combined + facet_wrap(~arm)
-  }
-
   # File paths for separate plots
   part_png  <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_soc_outcome.png"))
   part_pdf  <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_soc_outcome.pdf"))
   env_png   <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_env_outcome.png"))
   env_pdf   <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_env_outcome.pdf"))
-  combined_png <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_combined.png"))
-  combined_pdf <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_combined.pdf"))
 
   ggsave(part_png,  plt_part, width = 8, height = 5, dpi = 300)
   ggsave(part_pdf,  plt_part, width = 8, height = 5)
   ggsave(env_png,   plt_env,  width = 8, height = 5, dpi = 300)
   ggsave(env_pdf,   plt_env,  width = 8, height = 5)
-  ggsave(combined_png, plt_combined, width = if (multi_arm) 10 else 8, height = 5, dpi = 300)
-  ggsave(combined_pdf, plt_combined, width = if (multi_arm) 10 else 8, height = 5)
   message("Exported results to:\n", csv_path, "\n", long_csv_path, "\n",
-  part_png, "\n", part_pdf, "\n", env_png,  "\n", env_pdf, "\n", combined_png, "\n", combined_pdf, "\n",
-    last_data_csv)
+  part_png, "\n", part_pdf, "\n", env_png,  "\n", env_pdf,
+    "\n",
+    last_data_csv,
+    if (length(last_diag_files) > 0) paste0("\n", paste(unlist(last_diag_files), collapse = "\n")) else "")
 
   list(results = results,
     csv = csv_path,
     last_sim_data_csv = last_data_csv,
+    last_diag = last_diag_files,
     # Preferred names
     soc_outcome_png = part_png,
     soc_outcome_pdf = part_pdf,
     env_outcome_png = env_png,
     env_outcome_pdf = env_pdf,
-  combined_png = combined_png,
-  combined_pdf = combined_pdf,
-  plot_combined = plt_combined,
     plot_soc_outcome = plt_part,
     plot_env_outcome = plt_env,
     long_table = long_table,

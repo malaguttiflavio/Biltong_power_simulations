@@ -130,6 +130,13 @@
 			"command": "Rscript code/Biltong_power_simulations_master.r | tail -n 60",
 			"problemMatcher": [],
 			"group": "build"
+		},
+		{
+			"label": "Run power master (tail)",
+			"type": "shell",
+			"command": "Rscript code/Biltong_power_simulations_master.r | tail -n 80",
+			"problemMatcher": [],
+			"group": "build"
 		}
 	]
 }
