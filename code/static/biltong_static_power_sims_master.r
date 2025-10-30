@@ -29,8 +29,15 @@ script_dir <- tryCatch(
     getwd()
   }
 )
-source(file.path(script_dir, "biltong_power_simulations_utils.r"))
-source(file.path(script_dir, "biltong_power_simulations_engine.r"))
+source(file.path(script_dir, "..", "common", "biltong_power_utils.r"))
+source(file.path(script_dir, "biltong_static_power_sims_engine.r"))
+
+# Resolve project root relative to this script and set output directories (static artifacts)
+project_root <- normalizePath(file.path(script_dir, "..", ".."))
+tabs_dir <- file.path(project_root, "output", "static", "tabs")
+figs_dir <- file.path(project_root, "output", "static", "figs")
+if (!dir.exists(tabs_dir)) dir.create(tabs_dir, recursive = TRUE)
+if (!dir.exists(figs_dir)) dir.create(figs_dir, recursive = TRUE)
 
 # ------------------------------ Specify Scenario ------------------------------ #
 n_communities            <- 130

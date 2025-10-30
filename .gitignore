@@ -1,0 +1,19 @@
+# macOS cruft
+.DS_Store
+
+# R / RStudio
+.Rhistory
+.RData
+.Rproj.user/
+.Ruserdata
+
+# VS Code workspace settings (optional to ignore if customized)
+.vscode/
+
+# Simulation outputs: keep docs, ignore generated artifacts
+/output/*
+!/output/docs/
+!/output/docs/**
+
+# Prevent accidental outputs under code/
+code/output/

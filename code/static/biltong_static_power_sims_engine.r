@@ -882,12 +882,7 @@ simulate_power <- function(
 
   cat("Simulation complete. Saving CSVs to tabs/ and figures to figs/...\n")
 
-  # Set output directories (tabs for CSV/tables; figs for images)
-  tabs_dir <- "/Users/flavioamalagutti/Documents/Work/GitHub/Research_Projects/Biltong/Simulations/Biltong_power_simulations/output/tabs"
-  figs_dir <- "/Users/flavioamalagutti/Documents/Work/GitHub/Research_Projects/Biltong/Simulations/Biltong_power_simulations/output/figs"
 
-  if (!dir.exists(tabs_dir)) dir.create(tabs_dir, recursive = TRUE)
-  if (!dir.exists(figs_dir)) dir.create(figs_dir, recursive = TRUE)
   # Save CSV
   csv_path  <- file.path(tabs_dir, glue::glue("{outfile_stem}_{sweep_param}.csv"))
   write_csv(results, csv_path)
