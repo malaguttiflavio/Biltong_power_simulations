@@ -12,7 +12,9 @@ simulate_power <- function(
     "soc_outcome_T","soc_outcome_ICC","soc_outcome_AR1_rho","soc_outcome_AR1_var",
     "env_outcome_T","env_outcome_ICC","env_outcome_AR1_rho","env_outcome_AR1_var",
     # convenience aliases from master script
-    "soc_outcome_ate_pct_single","env_outcome_ate_single"
+    "soc_outcome_ate_pct_single","env_outcome_ate_single",
+    # multi-arm ATE containers (supported for sweeps per-arm or jointly)
+    "soc_outcome_ate_pct_multi","env_outcome_ate_multi"
   ),
   sweep_arm = NULL,
   sweep_values = NULL,
@@ -41,6 +43,11 @@ simulate_power <- function(
     cols
   }
   sweep_param <- match.arg(sweep_param)
+  # Decide which outcomes to compute/display based on sweep_param
+  is_soc_sweep <- grepl("^soc_", sweep_param)
+  is_env_sweep <- grepl("^env_", sweep_param)
+  do_soc <- if (is_soc_sweep) TRUE else if (is_env_sweep) FALSE else TRUE
+  do_env <- if (is_env_sweep) TRUE else if (is_soc_sweep) FALSE else TRUE
   # ---------------------- Basic multi-arm validation & normalization ---------------------- #
   normalize_config <- function(cfg) {
     # Ensure arms include control as first element
@@ -267,14 +274,26 @@ simulate_power <- function(
 
   # Helpers to retrieve per-arm effects using config variable names directly
   get_soc_ate_pct <- function(cfgx) {
-    # Prefer scenario-specific names; fallback to canonical if present
-    if (!is.null(cfgx$soc_outcome_ate_pct_single)) return(cfgx$soc_outcome_ate_pct_single)
-    if (!is.null(cfgx$soc_outcome_ate_pct_multi))  return(cfgx$soc_outcome_ate_pct_multi)
+    # Prefer multi container when multi-arm; prefer single when single-arm
+    trt_arms <- setdiff(cfgx$arms %||% character(), "control")
+    if (length(trt_arms) > 1) {
+      if (!is.null(cfgx$soc_outcome_ate_pct_multi)) return(cfgx$soc_outcome_ate_pct_multi)
+      if (!is.null(cfgx$soc_outcome_ate_pct_single)) return(cfgx$soc_outcome_ate_pct_single)
+    } else {
+      if (!is.null(cfgx$soc_outcome_ate_pct_single)) return(cfgx$soc_outcome_ate_pct_single)
+      if (!is.null(cfgx$soc_outcome_ate_pct_multi))  return(cfgx$soc_outcome_ate_pct_multi)
+    }
     NULL
   }
   get_env_add <- function(cfgx) {
-    if (!is.null(cfgx$env_outcome_ate_single)) return(cfgx$env_outcome_ate_single)
-    if (!is.null(cfgx$env_outcome_ate_multi))  return(cfgx$env_outcome_ate_multi)
+    trt_arms <- setdiff(cfgx$arms %||% character(), "control")
+    if (length(trt_arms) > 1) {
+      if (!is.null(cfgx$env_outcome_ate_multi))  return(cfgx$env_outcome_ate_multi)
+      if (!is.null(cfgx$env_outcome_ate_single)) return(cfgx$env_outcome_ate_single)
+    } else {
+      if (!is.null(cfgx$env_outcome_ate_single)) return(cfgx$env_outcome_ate_single)
+      if (!is.null(cfgx$env_outcome_ate_multi))  return(cfgx$env_outcome_ate_multi)
+    }
     # Fallback default: zeros per treatment arm if neither provided
     trt_arms <- setdiff(cfgx$arms %||% character(), "control")
     if (length(trt_arms) > 0) return(setNames(rep(0, length(trt_arms)), trt_arms))
@@ -339,9 +358,11 @@ simulate_power <- function(
     assigned[, c("community_id","arm")]
   }
 
-  # One Monte Carlo run returning p-values for ITT and TOT for both outcomes, per treatment arm
+  # One Monte Carlo run returning p-values for ITT and TOT for selected outcomes, per treatment arm
   one_run <- function(config_run, capture_data = FALSE) {
     smp <- make_sample(config_run)
+    # Define treatment arms once for this run (used in both socio-economic and environmental blocks)
+    trt_arms <- setdiff(config_run$arms, "control")
 
     # ----------------------------- Assignment ----------------------------- #
     # Prefer multi-arm assignment using arms + alloc_ratios; fallback to binary alloc_ratio
@@ -457,8 +478,8 @@ simulate_power <- function(
       df_env$D <- df_env$D_bar
     }
 
-    # ------------------- Participation outcome generation ------------------ #
-    if (config_run$experiment_type == "community_level") {
+  # ------------------- Participation outcome generation ------------------ #
+  if (do_soc && config_run$experiment_type == "community_level") {
       # AR(1) innovation variance for socio-economic outcome, defaulting to 1 if not provided
       var_e_p <- if (!is.null(config_run$soc_outcome_AR1_var)) config_run$soc_outcome_AR1_var else 1
       # Between-community random intercept variance: decoupled from AR1 variance.
@@ -487,7 +508,7 @@ simulate_power <- function(
       } else {
         df_soc$Y <- r_count(length(mu), mu, family = config_run$soc_outcome_dist, theta = config_run$soc_outcome_theta)
       }
-    } else {
+  } else if (do_soc && config_run$experiment_type != "community_level") {
       # individual_within_community
       var_e_p <- if (!is.null(config_run$soc_outcome_AR1_var)) config_run$soc_outcome_AR1_var else 1
       if (config_run$soc_outcome_ICC >= 1 || config_run$soc_outcome_ICC < 0) stop("soc_outcome_ICC must be in [0,1)")
@@ -515,98 +536,102 @@ simulate_power <- function(
     }
 
     # ----------------------------- Participation OLS ----------------------------- #
-    df_soc$arm <- factor(df_soc$arm, levels = config_run$arms)
-    # Optional stratifier controls
-    strata_terms <- NULL
-    if (isTRUE(config_run$use_strata_controls)) {
-      st <- c("year_in_program","ngo_id","tribe_id")
-      st <- st[st %in% names(df_soc)]
-      if (length(st) > 0) {
-        strata_terms <- paste0("factor(", st, ")")
-      }
-    }
-    base_terms <- c("arm", "factor(time)", strata_terms)
-    rhs_no_fe <- paste(base_terms[!is.na(base_terms) & base_terms != ""], collapse = " + ")
-    form_p <- if (isTRUE(config_run$cluster_fe_yn)) {
-      as.formula(paste("Y ~", paste(c(rhs_no_fe, "factor(community_id)"), collapse = " + ")))
-    } else {
-      as.formula(paste("Y ~", rhs_no_fe))
-    }
-    fit_itt_p <- lm(form_p, data = df_soc)
-    if (isTRUE(config_run$cluster_se)) {
-      vc_p <- tryCatch(sandwich::vcovCL(fit_itt_p, cluster = ~ community_id), error = function(e) sandwich::vcovHC(fit_itt_p, type = config_run$hc_type))
-      ct_p <- lmtest::coeftest(fit_itt_p, vcov. = vc_p)
-      tt_itt_p <- tibble(term = rownames(ct_p), estimate = ct_p[,1], std_error = ct_p[,2], statistic = ct_p[,3], p_value = ct_p[,4])
-    } else {
-      tt_itt_p  <- robust_test(fit_itt_p, hc_type = config_run$hc_type)
-    }
-
-    # Collect ITT & TOT p-values per treatment arm
-    trt_arms <- setdiff(config_run$arms, "control")
-    p_itt_p_vec <- setNames(rep(NA_real_, length(trt_arms)), trt_arms)
-    p_tot_p_vec <- setNames(rep(NA_real_, length(trt_arms)), trt_arms)
-
-    # ITT (OLS) p-values per arm
-    for (a in trt_arms) {
-      term_a <- paste0("arm", a)
-      p_itt_p_vec[a] <- tt_itt_p$p_value[tt_itt_p$term == term_a]
-    }
-
-    # TOT (IV) per arm: run separate IV using only control + that arm for clarity
-    for (a in trt_arms) {
-      df_sub <- df_soc[df_soc$arm %in% c("control", a), , drop = FALSE]
-      # Re-factor for subset to avoid singularities
-      df_sub$arm <- droplevels(df_sub$arm)
-      df_sub$Z_eval <- as.integer(df_sub$arm == a)
-      use_fe_iv_p <- isTRUE(config_run$cluster_fe_yn) && !(config_run$experiment_type == "community_level")
-      if (isTRUE(config_run$cluster_fe_yn) && config_run$experiment_type == "community_level") use_fe_iv_p <- FALSE
-      strata_rhs <- if (!is.null(strata_terms) && length(strata_terms) > 0) paste("+", paste(strata_terms, collapse = " + ")) else ""
-      if (use_fe_iv_p) {
-        iv_form_sub <- as.formula(paste(
-          "Y ~ D + factor(time)", strata_rhs, "+ factor(community_id) | Z_eval + factor(time)", strata_rhs, "+ factor(community_id)"
-        ))
-      } else {
-        iv_form_sub <- as.formula(paste(
-          "Y ~ D + factor(time)", strata_rhs, "| Z_eval + factor(time)", strata_rhs
-        ))
-      }
-      iv_fit_sub <- tryCatch(AER::ivreg(iv_form_sub, data = df_sub), error = function(e) NULL)
-      if (!is.null(iv_fit_sub)) {
-        if (isTRUE(config_run$cluster_se)) {
-          vc_iv_sub <- tryCatch(sandwich::vcovCL(iv_fit_sub, cluster = ~ community_id), error = function(e) sandwich::vcovHC(iv_fit_sub, type = config_run$hc_type))
-          ct_iv_sub <- lmtest::coeftest(iv_fit_sub, vcov. = vc_iv_sub)
-        } else {
-          ct_iv_sub <- lmtest::coeftest(iv_fit_sub, vcov. = sandwich::vcovHC(iv_fit_sub, type = config_run$hc_type))
+    if (do_soc) {
+      df_soc$arm <- factor(df_soc$arm, levels = config_run$arms)
+      # Optional stratifier controls
+      strata_terms <- NULL
+      if (isTRUE(config_run$use_strata_controls)) {
+        st <- c("year_in_program","ngo_id","tribe_id")
+        st <- st[st %in% names(df_soc)]
+        if (length(st) > 0) {
+          strata_terms <- paste0("factor(", st, ")")
         }
-        p_tot_p_vec[a] <- if ("D" %in% rownames(ct_iv_sub)) ct_iv_sub["D","Pr(>|t|)"] else NA_real_
+      }
+      base_terms <- c("arm", "factor(time)", strata_terms)
+      rhs_no_fe <- paste(base_terms[!is.na(base_terms) & base_terms != ""], collapse = " + ")
+      form_p <- if (isTRUE(config_run$cluster_fe_yn)) {
+        as.formula(paste("Y ~", paste(c(rhs_no_fe, "factor(community_id)"), collapse = " + ")))
       } else {
-        p_tot_p_vec[a] <- NA_real_
+        as.formula(paste("Y ~", rhs_no_fe))
+      }
+      fit_itt_p <- lm(form_p, data = df_soc)
+      if (isTRUE(config_run$cluster_se)) {
+        vc_p <- tryCatch(sandwich::vcovCL(fit_itt_p, cluster = ~ community_id), error = function(e) sandwich::vcovHC(fit_itt_p, type = config_run$hc_type))
+        ct_p <- lmtest::coeftest(fit_itt_p, vcov. = vc_p)
+        tt_itt_p <- tibble(term = rownames(ct_p), estimate = ct_p[,1], std_error = ct_p[,2], statistic = ct_p[,3], p_value = ct_p[,4])
+      } else {
+        tt_itt_p  <- robust_test(fit_itt_p, hc_type = config_run$hc_type)
+      }
+
+      # Collect ITT & TOT p-values per treatment arm
+      trt_arms <- setdiff(config_run$arms, "control")
+      p_itt_p_vec <- setNames(rep(NA_real_, length(trt_arms)), trt_arms)
+      p_tot_p_vec <- setNames(rep(NA_real_, length(trt_arms)), trt_arms)
+
+      # ITT (OLS) p-values per arm
+      for (a in trt_arms) {
+        term_a <- paste0("arm", a)
+        p_itt_p_vec[a] <- tt_itt_p$p_value[tt_itt_p$term == term_a]
+      }
+
+      # TOT (IV) per arm: run separate IV using only control + that arm for clarity
+      for (a in trt_arms) {
+        df_sub <- df_soc[df_soc$arm %in% c("control", a), , drop = FALSE]
+        # Re-factor for subset to avoid singularities
+        df_sub$arm <- droplevels(df_sub$arm)
+        df_sub$Z_eval <- as.integer(df_sub$arm == a)
+        use_fe_iv_p <- isTRUE(config_run$cluster_fe_yn) && !(config_run$experiment_type == "community_level")
+        if (isTRUE(config_run$cluster_fe_yn) && config_run$experiment_type == "community_level") use_fe_iv_p <- FALSE
+        strata_rhs <- if (!is.null(strata_terms) && length(strata_terms) > 0) paste("+", paste(strata_terms, collapse = " + ")) else ""
+        if (use_fe_iv_p) {
+          iv_form_sub <- as.formula(paste(
+            "Y ~ D + factor(time)", strata_rhs, "+ factor(community_id) | Z_eval + factor(time)", strata_rhs, "+ factor(community_id)"
+          ))
+        } else {
+          iv_form_sub <- as.formula(paste(
+            "Y ~ D + factor(time)", strata_rhs, "| Z_eval + factor(time)", strata_rhs
+          ))
+        }
+        iv_fit_sub <- tryCatch(AER::ivreg(iv_form_sub, data = df_sub), error = function(e) NULL)
+        if (!is.null(iv_fit_sub)) {
+          if (isTRUE(config_run$cluster_se)) {
+            vc_iv_sub <- tryCatch(sandwich::vcovCL(iv_fit_sub, cluster = ~ community_id), error = function(e) sandwich::vcovHC(iv_fit_sub, type = config_run$hc_type))
+            ct_iv_sub <- lmtest::coeftest(iv_fit_sub, vcov. = vc_iv_sub)
+          } else {
+            ct_iv_sub <- lmtest::coeftest(iv_fit_sub, vcov. = sandwich::vcovHC(iv_fit_sub, type = config_run$hc_type))
+          }
+          p_tot_p_vec[a] <- if ("D" %in% rownames(ct_iv_sub)) ct_iv_sub["D","Pr(>|t|)"] else NA_real_
+        } else {
+          p_tot_p_vec[a] <- NA_real_
+        }
       }
     }
 
     # ---------------------------- Environmental generation ---------------------------- #
     # AR(1) innovation variance for environmental outcome. If not provided, default to base_sd^2
-    var_e_v <- if (!is.null(config_run$env_outcome_AR1_var)) config_run$env_outcome_AR1_var else (config_run$env_outcome_base_sd^2)
-    # Between-community variance decoupled from AR1 variance; use ICC only
-    if (config_run$env_outcome_ICC >= 1 || config_run$env_outcome_ICC < 0) stop("env_outcome_ICC must be in [0,1)")
-    var_u_v <- if (config_run$env_outcome_ICC == 0) 0 else (config_run$env_outcome_ICC / (1 - config_run$env_outcome_ICC))
-    u_comm_v <- rnorm(config_run$n_communities, 0, sqrt(pmax(var_u_v, 0)))
-    sigma_e_v <- if (var_e_v <= 0) 0 else sqrt(var_e_v)
-    df_env <- df_env |>
-      left_join(tibble(community_id = 1:config_run$n_communities, u_comm_v), by = "community_id") |>
-      group_by(community_id) |>
-      arrange(time, .by_group = TRUE) |>
-  mutate(e_ar = ar1_series(time, rho = config_run$env_outcome_AR1_rho, sigma = sigma_e_v)) |>
-      ungroup()
+    if (do_env) {
+      var_e_v <- if (!is.null(config_run$env_outcome_AR1_var)) config_run$env_outcome_AR1_var else (config_run$env_outcome_base_sd^2)
+      # Between-community variance decoupled from AR1 variance; use ICC only
+      if (config_run$env_outcome_ICC >= 1 || config_run$env_outcome_ICC < 0) stop("env_outcome_ICC must be in [0,1)")
+      var_u_v <- if (config_run$env_outcome_ICC == 0) 0 else (config_run$env_outcome_ICC / (1 - config_run$env_outcome_ICC))
+      u_comm_v <- rnorm(config_run$n_communities, 0, sqrt(pmax(var_u_v, 0)))
+      sigma_e_v <- if (var_e_v <= 0) 0 else sqrt(var_e_v)
+      df_env <- df_env |>
+        left_join(tibble(community_id = 1:config_run$n_communities, u_comm_v), by = "community_id") |>
+        group_by(community_id) |>
+        arrange(time, .by_group = TRUE) |>
+        mutate(e_ar = ar1_series(time, rho = config_run$env_outcome_AR1_rho, sigma = sigma_e_v)) |>
+        ungroup()
 
-    # Ensure D exists from compliance block
-  if (!"D" %in% names(df_env)) stop("Column D missing in df_env after compliance")
-  df_env$arm <- factor(df_env$arm, levels = config_run$arms)
+      # Ensure D exists from compliance block
+      if (!"D" %in% names(df_env)) stop("Column D missing in df_env after compliance")
+      df_env$arm <- factor(df_env$arm, levels = config_run$arms)
 
-  vdm <- get_env_add(config_run)
-    add <- rep(0, nrow(df_env))
-    if (!is.null(vdm)) for (nm in names(vdm)) add[df_env$arm == nm] <- add[df_env$arm == nm] + vdm[[nm]]
-  df_env$Y <- config_run$env_outcome_base_mean + df_env$u_comm_v + df_env$e_ar + add * df_env$D + df_env$tau_strata * df_env$D
+      vdm <- get_env_add(config_run)
+      add <- rep(0, nrow(df_env))
+      if (!is.null(vdm)) for (nm in names(vdm)) add[df_env$arm == nm] <- add[df_env$arm == nm] + vdm[[nm]]
+      df_env$Y <- config_run$env_outcome_base_mean + df_env$u_comm_v + df_env$e_ar + add * df_env$D + df_env$tau_strata * df_env$D
+    }
 
     # ------------------------------- Environmental OLS -------------------------------- #
     # Environmental ITT with optional stratifier controls
@@ -623,59 +648,61 @@ simulate_power <- function(
     } else {
       as.formula(paste("Y ~", rhs_no_fe_v))
     }
-    fit_itt_v <- lm(form_v, data = df_env)
-    if (isTRUE(config_run$cluster_se)) {
-      vc_v <- tryCatch(sandwich::vcovCL(fit_itt_v, cluster = ~ community_id), error = function(e) sandwich::vcovHC(fit_itt_v, type = config_run$hc_type))
-      ct_v <- lmtest::coeftest(fit_itt_v, vcov. = vc_v)
-      tt_itt_v <- tibble(term = rownames(ct_v), estimate = ct_v[,1], std_error = ct_v[,2], statistic = ct_v[,3], p_value = ct_v[,4])
-    } else {
-      tt_itt_v  <- robust_test(fit_itt_v, hc_type = config_run$hc_type)
-    }
-  # ITT per arm (environmental)
-    p_itt_v_vec <- setNames(rep(NA_real_, length(trt_arms)), trt_arms)
-    for (a in trt_arms) {
-      term_a <- paste0("arm", a)
-      p_itt_v_vec[a] <- tt_itt_v$p_value[tt_itt_v$term == term_a]
-    }
-  # TOT per arm (environmental) via separate IV on control + that arm
-    p_tot_v_vec <- setNames(rep(NA_real_, length(trt_arms)), trt_arms)
-    for (a in trt_arms) {
-      df_sub_v <- df_env[df_env$arm %in% c("control", a), , drop = FALSE]
-      df_sub_v$arm <- droplevels(df_sub_v$arm)
-      df_sub_v$Z_eval <- as.integer(df_sub_v$arm == a)
-      use_fe_iv_v <- isTRUE(config_run$cluster_fe_yn) && !(config_run$experiment_type == "community_level")
-      if (isTRUE(config_run$cluster_fe_yn) && config_run$experiment_type == "community_level") use_fe_iv_v <- FALSE
-      strata_rhs_v <- if (!is.null(strata_terms_v) && length(strata_terms_v) > 0) paste("+", paste(strata_terms_v, collapse = " + ")) else ""
-      if (use_fe_iv_v) {
-        iv_form_sub_v <- as.formula(paste(
-          "Y ~ D + factor(time)", strata_rhs_v, "+ factor(community_id) | Z_eval + factor(time)", strata_rhs_v, "+ factor(community_id)"
-        ))
+    if (do_env) {
+      fit_itt_v <- lm(form_v, data = df_env)
+      if (isTRUE(config_run$cluster_se)) {
+        vc_v <- tryCatch(sandwich::vcovCL(fit_itt_v, cluster = ~ community_id), error = function(e) sandwich::vcovHC(fit_itt_v, type = config_run$hc_type))
+        ct_v <- lmtest::coeftest(fit_itt_v, vcov. = vc_v)
+        tt_itt_v <- tibble(term = rownames(ct_v), estimate = ct_v[,1], std_error = ct_v[,2], statistic = ct_v[,3], p_value = ct_v[,4])
       } else {
-        iv_form_sub_v <- as.formula(paste(
-          "Y ~ D + factor(time)", strata_rhs_v, "| Z_eval + factor(time)", strata_rhs_v
-        ))
+        tt_itt_v  <- robust_test(fit_itt_v, hc_type = config_run$hc_type)
       }
-      iv_fit_sub_v <- tryCatch(AER::ivreg(iv_form_sub_v, data = df_sub_v), error = function(e) NULL)
-      if (!is.null(iv_fit_sub_v)) {
-        if (isTRUE(config_run$cluster_se)) {
-          vc_iv_sub_v <- tryCatch(sandwich::vcovCL(iv_fit_sub_v, cluster = ~ community_id), error = function(e) sandwich::vcovHC(iv_fit_sub_v, type = config_run$hc_type))
-          ct_iv_sub_v <- lmtest::coeftest(iv_fit_sub_v, vcov. = vc_iv_sub_v)
+      # ITT per arm (environmental)
+      p_itt_v_vec <- setNames(rep(NA_real_, length(trt_arms)), trt_arms)
+      for (a in trt_arms) {
+        term_a <- paste0("arm", a)
+        p_itt_v_vec[a] <- tt_itt_v$p_value[tt_itt_v$term == term_a]
+      }
+      # TOT per arm (environmental) via separate IV on control + that arm
+      p_tot_v_vec <- setNames(rep(NA_real_, length(trt_arms)), trt_arms)
+      for (a in trt_arms) {
+        df_sub_v <- df_env[df_env$arm %in% c("control", a), , drop = FALSE]
+        df_sub_v$arm <- droplevels(df_sub_v$arm)
+        df_sub_v$Z_eval <- as.integer(df_sub_v$arm == a)
+        use_fe_iv_v <- isTRUE(config_run$cluster_fe_yn) && !(config_run$experiment_type == "community_level")
+        if (isTRUE(config_run$cluster_fe_yn) && config_run$experiment_type == "community_level") use_fe_iv_v <- FALSE
+        strata_rhs_v <- if (!is.null(strata_terms_v) && length(strata_terms_v) > 0) paste("+", paste(strata_terms_v, collapse = " + ")) else ""
+        if (use_fe_iv_v) {
+          iv_form_sub_v <- as.formula(paste(
+            "Y ~ D + factor(time)", strata_rhs_v, "+ factor(community_id) | Z_eval + factor(time)", strata_rhs_v, "+ factor(community_id)"
+          ))
         } else {
-          ct_iv_sub_v <- lmtest::coeftest(iv_fit_sub_v, vcov. = sandwich::vcovHC(iv_fit_sub_v, type = config_run$hc_type))
+          iv_form_sub_v <- as.formula(paste(
+            "Y ~ D + factor(time)", strata_rhs_v, "| Z_eval + factor(time)", strata_rhs_v
+          ))
         }
-        p_tot_v_vec[a] <- if ("D" %in% rownames(ct_iv_sub_v)) ct_iv_sub_v["D","Pr(>|t|)"] else NA_real_
-      } else {
-        p_tot_v_vec[a] <- NA_real_
+        iv_fit_sub_v <- tryCatch(AER::ivreg(iv_form_sub_v, data = df_sub_v), error = function(e) NULL)
+        if (!is.null(iv_fit_sub_v)) {
+          if (isTRUE(config_run$cluster_se)) {
+            vc_iv_sub_v <- tryCatch(sandwich::vcovCL(iv_fit_sub_v, cluster = ~ community_id), error = function(e) sandwich::vcovHC(iv_fit_sub_v, type = config_run$hc_type))
+            ct_iv_sub_v <- lmtest::coeftest(iv_fit_sub_v, vcov. = vc_iv_sub_v)
+          } else {
+            ct_iv_sub_v <- lmtest::coeftest(iv_fit_sub_v, vcov. = sandwich::vcovHC(iv_fit_sub_v, type = config_run$hc_type))
+          }
+          p_tot_v_vec[a] <- if ("D" %in% rownames(ct_iv_sub_v)) ct_iv_sub_v["D","Pr(>|t|)"] else NA_real_
+        } else {
+          p_tot_v_vec[a] <- NA_real_
+        }
       }
     }
 
     # Return list elements with per-arm naming
     out_list <- list()
     for (a in trt_arms) {
-      out_list[[paste0("p_itt_p_", a)]]  <- p_itt_p_vec[a]
-      out_list[[paste0("p_tot_p_", a)]]  <- p_tot_p_vec[a]
-      out_list[[paste0("p_itt_v_", a)]]  <- p_itt_v_vec[a]
-      out_list[[paste0("p_tot_v_", a)]]  <- p_tot_v_vec[a]
+      if (exists("p_itt_p_vec")) out_list[[paste0("p_itt_p_", a)]]  <- p_itt_p_vec[a]
+      if (exists("p_tot_p_vec")) out_list[[paste0("p_tot_p_", a)]]  <- p_tot_p_vec[a]
+      if (exists("p_itt_v_vec")) out_list[[paste0("p_itt_v_", a)]]  <- p_itt_v_vec[a]
+      if (exists("p_tot_v_vec")) out_list[[paste0("p_tot_v_", a)]]  <- p_tot_v_vec[a]
     }
     if (isTRUE(capture_data)) {
       out_list$last_df_soc <- df_soc
@@ -691,19 +718,26 @@ simulate_power <- function(
     config_sweep <- config
     # Socio-economic ATE sweep: use config-native names only
     if (sweep_param %in% c("soc_outcome_ate_pct_single","soc_outcome_ate_pct_multi")) {
-      # Choose which container to update based on presence/preference
-      mrr_container <- if (!is.null(config_sweep$soc_outcome_ate_pct_single) || sweep_param == "soc_outcome_ate_pct_single") {
-        "soc_outcome_ate_pct_single"
-      } else if (!is.null(config_sweep$soc_outcome_ate_pct_multi) || sweep_param == "soc_outcome_ate_pct_multi") {
-        "soc_outcome_ate_pct_multi"
-      } else stop("soc_outcome_ate_pct_* must be defined in config")
+      # Choose container based on arm count: multi-arm -> *_multi, single-arm -> *_single
+      trt_arms_local <- setdiff(config_sweep$arms, "control")
+      mrr_container <- if (length(trt_arms_local) > 1) "soc_outcome_ate_pct_multi" else "soc_outcome_ate_pct_single"
+      # Initialize container if missing
+      if (is.null(config_sweep[[mrr_container]])) {
+        # Try to pull from the other container or default to neutral effects
+        alt <- if (mrr_container == "soc_outcome_ate_pct_multi") config_sweep$soc_outcome_ate_pct_single else config_sweep$soc_outcome_ate_pct_multi
+        if (!is.null(alt)) {
+          config_sweep[[mrr_container]] <- alt[trt_arms_local]
+        } else {
+          config_sweep[[mrr_container]] <- setNames(rep(1, length(trt_arms_local)), trt_arms_local)
+        }
+      }
       local_arm <- if (!is.null(override_arm)) override_arm else sweep_arm
       if (!is.null(local_arm)) {
         if (is.null(config_sweep[[mrr_container]])) stop(mrr_container, " must be defined in config")
         config_sweep[[mrr_container]][[local_arm]] <- val
       } else {
         # If a scalar val provided without specifying arm, recycle across all treatment arms
-        treatment_arms <- setdiff(config_sweep$arms, "control")
+        treatment_arms <- trt_arms_local
         if (length(val) == 1 && is.null(names(val))) {
           config_sweep[[mrr_container]] <- setNames(rep(val, length(treatment_arms)), treatment_arms)
         } else {
@@ -717,17 +751,24 @@ simulate_power <- function(
     }
     # Environmental ATE sweep: support config-native names and canonical
     if (sweep_param %in% c("env_outcome_ate_single","env_outcome_ate_multi")) {
-      vdm_container <- if (!is.null(config_sweep$env_outcome_ate_single) || sweep_param == "env_outcome_ate_single") {
-        "env_outcome_ate_single"
-      } else if (!is.null(config_sweep$env_outcome_ate_multi) || sweep_param == "env_outcome_ate_multi") {
-        "env_outcome_ate_multi"
-      } else stop("env_outcome_ate_* must be defined in config")
+      # Choose container based on arm count: multi-arm -> *_multi, single-arm -> *_single
+      trt_arms_local <- setdiff(config_sweep$arms, "control")
+      vdm_container <- if (length(trt_arms_local) > 1) "env_outcome_ate_multi" else "env_outcome_ate_single"
+      # Initialize container if missing
+      if (is.null(config_sweep[[vdm_container]])) {
+        alt <- if (vdm_container == "env_outcome_ate_multi") config_sweep$env_outcome_ate_single else config_sweep$env_outcome_ate_multi
+        if (!is.null(alt)) {
+          config_sweep[[vdm_container]] <- alt[trt_arms_local]
+        } else {
+          config_sweep[[vdm_container]] <- setNames(rep(0, length(trt_arms_local)), trt_arms_local)
+        }
+      }
       local_arm <- if (!is.null(override_arm)) override_arm else sweep_arm
       if (!is.null(local_arm)) {
         if (is.null(config_sweep[[vdm_container]])) stop(vdm_container, " must be defined in config")
         config_sweep[[vdm_container]][[local_arm]] <- val
       } else {
-        treatment_arms <- setdiff(config_sweep$arms, "control")
+        treatment_arms <- trt_arms_local
         if (length(val) == 1 && is.null(names(val))) {
           config_sweep[[vdm_container]] <- setNames(rep(val, length(treatment_arms)), treatment_arms)
         } else {
@@ -768,16 +809,18 @@ simulate_power <- function(
     # Per-arm power calculations
     pow_list <- list()
     for (a in trt_arms) {
-      p_itt_p_vec <- sapply(res, `[[`, paste0("p_itt_p_", a))
-      p_tot_p_vec <- sapply(res, `[[`, paste0("p_tot_p_", a))
-      p_itt_v_vec <- sapply(res, `[[`, paste0("p_itt_v_", a))
-      p_tot_v_vec <- sapply(res, `[[`, paste0("p_tot_v_", a))
-      # Socio-economic outcome (generic count outcome)
-      pow_list[[paste0("power_ITT_soc_outcome_", a)]] <- get_rate(p_itt_p_vec)
-      pow_list[[paste0("power_TOT_soc_outcome_", a)]] <- get_rate(p_tot_p_vec)
-  # Environmental outcome
-      pow_list[[paste0("power_ITT_env_outcome_", a)]] <- get_rate(p_itt_v_vec)
-      pow_list[[paste0("power_TOT_env_outcome_", a)]] <- get_rate(p_tot_v_vec)
+        if (do_soc) {
+          p_itt_p_vec <- sapply(res, `[[`, paste0("p_itt_p_", a))
+          p_tot_p_vec <- sapply(res, `[[`, paste0("p_tot_p_", a))
+          pow_list[[paste0("power_ITT_soc_outcome_", a)]] <- get_rate(p_itt_p_vec)
+          pow_list[[paste0("power_TOT_soc_outcome_", a)]] <- get_rate(p_tot_p_vec)
+        }
+        if (do_env) {
+          p_itt_v_vec <- sapply(res, `[[`, paste0("p_itt_v_", a))
+          p_tot_v_vec <- sapply(res, `[[`, paste0("p_tot_v_", a))
+          pow_list[[paste0("power_ITT_env_outcome_", a)]] <- get_rate(p_itt_v_vec)
+          pow_list[[paste0("power_TOT_env_outcome_", a)]] <- get_rate(p_tot_v_vec)
+        }
   # Backward compatibility aliases (not used downstream here)
   # pow_list[[paste0("power_ITT_outcome_", a)]] <- pow_list[[paste0("power_ITT_soc_outcome_", a)]]
   # pow_list[[paste0("power_TOT_outcome_", a)]] <- pow_list[[paste0("power_TOT_soc_outcome_", a)]]
@@ -806,13 +849,17 @@ simulate_power <- function(
     if (length(trt_arms) == 1) {
       # duplicate unsuffixed for single-arm convenience
       a <- trt_arms[1]
-      out_row$power_ITT_soc_outcome <- out_row[[paste0("power_ITT_soc_outcome_", a)]]
-      out_row$power_TOT_soc_outcome <- out_row[[paste0("power_TOT_soc_outcome_", a)]]
-      out_row$power_ITT_env_outcome <- out_row[[paste0("power_ITT_env_outcome_", a)]]
-      out_row$power_TOT_env_outcome <- out_row[[paste0("power_TOT_env_outcome_", a)]]
-  # Backward compatibility (old names)
-  out_row$power_ITT_outcome <- out_row$power_ITT_soc_outcome
-  out_row$power_TOT_outcome <- out_row$power_TOT_soc_outcome
+      if (do_soc) {
+        out_row$power_ITT_soc_outcome <- out_row[[paste0("power_ITT_soc_outcome_", a)]]
+        out_row$power_TOT_soc_outcome <- out_row[[paste0("power_TOT_soc_outcome_", a)]]
+        # Backward compatibility (old names)
+        out_row$power_ITT_outcome <- out_row$power_ITT_soc_outcome
+        out_row$power_TOT_outcome <- out_row$power_TOT_soc_outcome
+      }
+      if (do_env) {
+        out_row$power_ITT_env_outcome <- out_row[[paste0("power_ITT_env_outcome_", a)]]
+        out_row$power_TOT_env_outcome <- out_row[[paste0("power_TOT_env_outcome_", a)]]
+      }
     }
     # Append effect size columns explicitly (renamed: arm_soc_outcome_ate_pct_*)
     for (a in trt_arms) {
@@ -891,7 +938,7 @@ simulate_power <- function(
   # Reshape for plotting; handle per-arm columns
   long_res <- results |>
     pivot_longer(
-      cols = matches("^power_(ITT|TOT)_(soc_outcome|env_outcome)(_.*)?$"),
+      cols = matches(paste0("^power_(ITT|TOT)_", if (do_soc && !do_env) "soc_outcome" else if (do_env && !do_soc) "env_outcome" else "(soc_outcome|env_outcome)" , "(_.*)?$")),
       names_to = "metric",
       values_to = "power"
     ) |>
@@ -934,17 +981,33 @@ simulate_power <- function(
   # Pivot effects for socio-economic ATE, preserving swept_arm as an identifier if present
   include_swept <- ("swept_arm" %in% names(results))
   id_cols <- c("sweep_value", if (include_swept) "swept_arm")
-  effect_mrr_long <- results |>
-    select(all_of(c(id_cols)), starts_with("arm_soc_outcome_ate_pct_")) |>
-    pivot_longer(cols = -all_of(id_cols), names_to = "effect_var", values_to = "arm_soc_outcome_ate_pct") |>
-    mutate(arm = sub("^arm_soc_outcome_ate_pct_", "", effect_var)) |>
-    select(-effect_var)
-  effect_env_long <- results |>
-    select(all_of(c(id_cols)), starts_with("arm_env_outcome_ate_")) |>
-    pivot_longer(cols = -all_of(id_cols), names_to = "effect_var", values_to = "arm_env_outcome_ate") |>
-    mutate(arm = sub("^arm_env_outcome_ate_", "", effect_var)) |>
-    select(-effect_var)
-  effects_join <- full_join(effect_mrr_long, effect_env_long, by = c(id_cols, "arm"))
+  effect_mrr_long <- if (do_soc) {
+    results |>
+      select(all_of(c(id_cols)), starts_with("arm_soc_outcome_ate_pct_")) |>
+      pivot_longer(cols = -all_of(id_cols), names_to = "effect_var", values_to = "arm_soc_outcome_ate_pct") |>
+      mutate(arm = sub("^arm_soc_outcome_ate_pct_", "", effect_var)) |>
+      select(-effect_var)
+  } else {
+    tibble()
+  }
+  effect_env_long <- if (do_env) {
+    results |>
+      select(all_of(c(id_cols)), starts_with("arm_env_outcome_ate_")) |>
+      pivot_longer(cols = -all_of(id_cols), names_to = "effect_var", values_to = "arm_env_outcome_ate") |>
+      mutate(arm = sub("^arm_env_outcome_ate_", "", effect_var)) |>
+      select(-effect_var)
+  } else {
+    tibble()
+  }
+  effects_join <- if (do_soc && do_env) {
+    full_join(effect_mrr_long, effect_env_long, by = c(id_cols, "arm"))
+  } else if (do_soc) {
+    effect_mrr_long
+  } else if (do_env) {
+    effect_env_long
+  } else {
+    tibble()
+  }
   long_table <- power_long |>
     left_join(effects_join, by = c(id_cols, "arm")) |>
     mutate(
@@ -973,11 +1036,7 @@ simulate_power <- function(
   # Apply the last sweep to config_last (mirror logic from run_for_value)
   if (sweep_param %in% c("soc_outcome_ate_pct_single","soc_outcome_ate_pct_multi")) {
     trt_arms_all <- setdiff(config_last$arms, "control")
-    mrr_container <- if (sweep_param == "soc_outcome_ate_pct_single" || !is.null(config_last$soc_outcome_ate_pct_single)) {
-      "soc_outcome_ate_pct_single"
-    } else if (sweep_param == "soc_outcome_ate_pct_multi" || !is.null(config_last$soc_outcome_ate_pct_multi)) {
-      "soc_outcome_ate_pct_multi"
-    } else stop("soc_outcome_ate_pct_* must be defined in config")
+    mrr_container <- if (length(trt_arms_all) > 1) "soc_outcome_ate_pct_multi" else "soc_outcome_ate_pct_single"
     if (sweep_each_arm) {
       last_arm <- tail(trt_arms_all, 1)
       if (is.null(config_last[[mrr_container]])) stop(mrr_container, " must be defined in config")
@@ -1008,11 +1067,7 @@ simulate_power <- function(
   if (sweep_param == "alloc_ratio")          config_last$alloc_ratio <- last_val
   if (sweep_param %in% c("env_outcome_ate_single","env_outcome_ate_multi")) {
     trt_arms_all <- setdiff(config_last$arms, "control")
-    vdm_container <- if (sweep_param == "env_outcome_ate_single" || !is.null(config_last$env_outcome_ate_single)) {
-      "env_outcome_ate_single"
-    } else if (sweep_param == "env_outcome_ate_multi" || !is.null(config_last$env_outcome_ate_multi)) {
-      "env_outcome_ate_multi"
-    } else stop("env_outcome_ate_* must be defined in config")
+    vdm_container <- if (length(trt_arms_all) > 1) "env_outcome_ate_multi" else "env_outcome_ate_single"
     if (!is.null(sweep_arm)) {
       if (is.null(config_last[[vdm_container]])) stop(vdm_container, " must be defined in config")
       config_last[[vdm_container]][[sweep_arm]] <- last_val
@@ -1131,26 +1186,29 @@ simulate_power <- function(
       guide = guide_legend(direction = "horizontal", label.position = "right")
     )
   }
-  # Simplified legend: only two entries (ITT solid, TOT dashed); color & linetype both map to estimator.
-  # NOTE: Arms are still distinguished in grouping but share aesthetics; if per-arm distinction is needed later,
-  # we can add facetting or minor alpha jitter. Assumption: user prioritizes compact legend over per-arm color.
+  # Multi-arm legend: distinguish both arm (color) and estimator (linetype)
   part_df <- part_df |> filter(!is.na(arm)) |> mutate(group_id = interaction(estimator, arm, drop = TRUE))
+  arms_in_plot <- sort(unique(part_df$arm))
+  arm_colors <- setNames(get_palette(length(arms_in_plot), "Dark2"), arms_in_plot)
   plt_part <- ggplot(part_df, aes(x = sweep_value, y = power,
                                   group = group_id,
-                                  color = estimator, linetype = estimator)) +
+                                  color = arm, linetype = estimator)) +
   geom_line(linewidth = 0.7) +
   geom_point(size = 2.0, show.legend = FALSE) +
     geom_hline(yintercept = 0.8, linetype = "dashed", color = "#666666") +
-    scale_color_manual(values = c(ITT = "#1b9e77", TOT = "#d95f02"), name = NULL) +
-    scale_linetype_manual(values = c(ITT = "solid", TOT = "dashed"), name = NULL) +
-    guides(color = guide_legend(order = 1), linetype = guide_legend(order = 1)) +
+    scale_color_manual(values = arm_colors, name = "Arm") +
+    scale_linetype_manual(values = c(ITT = "solid", TOT = "dashed"), name = "Estimator") +
+    guides(color = guide_legend(order = 1), linetype = guide_legend(order = 2)) +
     scale_x_continuous(breaks = unique(results$sweep_value)) +
     scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1), expand = c(0, 0)) +
     labs(
       x = sweep_param,
       y = "Power",
-      title = glue::glue("Power vs {sweep_param} (Socio-economic){if (multi_arm) ' by Arm' else ''}"),
-      subtitle = glue::glue("Design: {unique(results$experiment_type)} | Dist: {unique(results$outcome_dist)}"),
+      title = glue::glue("Power for different {sweep_param}"),
+      subtitle = {
+        arms_label <- if (multi_arm) "multi" else "single"
+        glue::glue("Design {unique(results$experiment_type)} | Dist {unique(results$outcome_dist)} | Arms: {arms_label}")
+      },
       caption = caption_text
     ) + base_theme
 
@@ -1191,22 +1249,28 @@ simulate_power <- function(
     )
   }
   env_df <- env_df |> filter(!is.na(arm)) |> mutate(group_id = interaction(estimator, arm, drop = TRUE))
+  env_arms_in_plot <- sort(unique(env_df$arm))
+  env_arm_colors <- setNames(get_palette(length(env_arms_in_plot), "Set1"), env_arms_in_plot)
   plt_env <- ggplot(env_df, aes(x = sweep_value, y = power,
                                 group = group_id,
-                                color = estimator, linetype = estimator)) +
+                                color = arm, linetype = estimator)) +
   geom_line(linewidth = 0.7) +
   geom_point(size = 2.0, show.legend = FALSE) +
     geom_hline(yintercept = 0.8, linetype = "dashed", color = "#666666") +
-    scale_color_manual(values = c(ITT = "#1b9e77", TOT = "#d95f02"), name = NULL) +
-    scale_linetype_manual(values = c(ITT = "solid", TOT = "dashed"), name = NULL) +
-    guides(color = guide_legend(order = 1), linetype = guide_legend(order = 1)) +
+    scale_color_manual(values = env_arm_colors, name = "Arm") +
+    scale_linetype_manual(values = c(ITT = "solid", TOT = "dashed"), name = "Estimator") +
+    guides(color = guide_legend(order = 1), linetype = guide_legend(order = 2)) +
     scale_x_continuous(breaks = unique(results$sweep_value)) +
     scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1), expand = c(0, 0)) +
     labs(
       x = sweep_param,
       y = "Power",
-      title = glue::glue("Power vs {sweep_param} (Environmental){if (multi_arm) ' by Arm' else ''}"),
-      subtitle = glue::glue("Design: {unique(results$experiment_type)}"),
+      title = glue::glue("Power for different {sweep_param}"),
+      subtitle = {
+        arms_label <- if (multi_arm) "multi" else "single"
+        # We reuse outcome_dist column which records socio-economic distribution; acceptable as global sim setting
+        glue::glue("Design {unique(results$experiment_type)} | Dist {unique(results$outcome_dist)} | Arms: {arms_label}")
+      },
       caption = caption_text
     ) + base_theme
 
@@ -1216,12 +1280,17 @@ simulate_power <- function(
   env_png   <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_env_outcome.png"))
   env_pdf   <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}_env_outcome.pdf"))
 
-  ggsave(part_png,  plt_part, width = 8, height = 5, dpi = 300)
-  ggsave(part_pdf,  plt_part, width = 8, height = 5)
-  ggsave(env_png,   plt_env,  width = 8, height = 5, dpi = 300)
-  ggsave(env_pdf,   plt_env,  width = 8, height = 5)
-  message("Exported results to:\n", csv_path, "\n", long_csv_path, "\n",
-  part_png, "\n", part_pdf, "\n", env_png,  "\n", env_pdf,
+  if (do_soc) {
+    ggsave(part_png,  plt_part, width = 8, height = 5, dpi = 300)
+    ggsave(part_pdf,  plt_part, width = 8, height = 5)
+  }
+  if (do_env) {
+    ggsave(env_png,   plt_env,  width = 8, height = 5, dpi = 300)
+    ggsave(env_pdf,   plt_env,  width = 8, height = 5)
+  }
+  message("Exported results to:\n", csv_path, "\n", long_csv_path,
+    if (do_soc) paste0("\n", part_png, "\n", part_pdf) else "",
+    if (do_env) paste0("\n", env_png,  "\n", env_pdf) else "",
     "\n",
     last_data_csv,
     if (length(last_diag_files) > 0) paste0("\n", paste(unlist(last_diag_files), collapse = "\n")) else "")
@@ -1230,11 +1299,11 @@ simulate_power <- function(
     csv = csv_path,
     last_sim_data_csv = last_data_csv,
     last_diag = last_diag_files,
-    # Preferred names
-    soc_outcome_png = part_png,
-    soc_outcome_pdf = part_pdf,
-    env_outcome_png = env_png,
-    env_outcome_pdf = env_pdf,
+    # Preferred names (present only if computed)
+    soc_outcome_png = if (do_soc) part_png else NULL,
+    soc_outcome_pdf = if (do_soc) part_pdf else NULL,
+    env_outcome_png = if (do_env) env_png else NULL,
+    env_outcome_pdf = if (do_env) env_pdf else NULL,
     plot_soc_outcome = plt_part,
     plot_env_outcome = plt_env,
     long_table = long_table,

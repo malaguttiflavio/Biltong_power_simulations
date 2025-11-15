@@ -1,0 +1,555 @@
+---
+title: "Cattle Tracking Power Simulations – Design and Explanation"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+# 1. Motivation and Context
+
+1.1. The Biltong / GRASS project and Meat Naturally’s Herding for Health (H4H) model work with communal farmer associations in South African rangelands to:
+   1.1.1. Implement rotational and adaptive planned grazing.  
+   1.1.2. Improve herd health and structure.  
+   1.1.3. Restore grasslands and increase soil organic carbon.  
+   1.1.4. Reduce enteric methane emissions and wildfire risk.
+
+1.2. Let:
+   1.2.1. \(i = 1,\dots,N\) index farmer associations (clusters).  
+   1.2.2. \(j = 1,\dots,n_i\) index tagged cows within association \(i\).  
+   1.2.3. \(t = 1,\dots,T\) index months of follow-up data since intervention.  
+   1.2.4. \(e = 1,\dots,E\) index within-month tracking events (e.g., days or day–night episodes).  
+
+1.3. Evaluating H4H-style rotational grazing interventions rigorously requires:
+   1.3.1. Estimating causal effects of association-level treatment on outcomes \(Y_{ijte}\) that summarize cow movement and grazing behavior.  
+   1.3.2. Using outcome measures tightly linked to grazing patterns and herd management, rather than relying only on coarse or subjective indicators.  
+
+1.4. GPS-based animal tracking provides a high-frequency panel of \(\{Y_{ijte}\}\) that:
+   1.4.1. Captures intensive-use patterns of individual cows (e.g., distance walked, time resting, day/night movements).  
+   1.4.2. Links directly to rotational grazing plans (e.g., compliance with rest periods, timing and duration of moves between paddocks).  
+   1.4.3. Can, in principle, be aggregated to association-level metrics aligned with ecological and carbon outcomes.
+
+1.5. However, precise tracking is costly. For each association, we must decide:
+   1.5.1. How many cows to tag (\(n_i\)), and thus the measurement intensity.  
+   1.5.2. How the cost of increasing \(n_i\) trades off against gains in statistical power to detect pre-specified treatment effects.  
+
+1.6. The cattle tracking power simulations are therefore designed to:
+   1.6.1. Mirror a realistic H4H-style randomized evaluation at the association level.  
+   1.6.2. Encode a flexible, multi-level data-generating process (DGP) for cow movement and grazing outcomes.  
+   1.6.3. Quantify power as a function of design parameters, with special focus on the number of tagged cows per association, `cows_tagged_per_association` (our main measurement-intensity lever).  
+
+# 2. Experimental Design and Data-Generating Process
+
+## 2.1 Units, Arms, and Assignment
+
+2.1.1. Clusters:
+   2.1.1.1. Randomization units are farmer associations (clusters), indexed by \(i = 1, \ldots, N\) and defaulted to 160.  
+
+2.1.2. Within-cluster population:
+   2.1.2.1. Each association \(i\) has a notional cattle population of size `cows_per_association` (default \(= 300\)).  
+   2.1.2.2. This population is the frame from which tagged cows are selected; untagged cows are not observed in the simulated dataset.
+
+2.1.3. Treatment arms:
+   2.1.3.1. Three arms are supported:  
+       2.1.3.1.1. Control.  
+       2.1.3.1.2. T1 (e.g. “CPR-like” design or tracking-plus-community-plan).  
+       2.1.3.1.3. T2 (e.g. “PA-like” design or tracking-plus-stronger enforcement/monitoring).  
+   2.1.3.2. Default allocation probabilities are:  
+       2.1.3.2.1. Control: 0.34.  
+       2.1.3.2.2. T1: 0.33.  
+       2.1.3.2.3. T2: 0.33.  
+   2.1.3.3. The code also supports a two-arm variant (e.g. Control vs T2) through alternative allocation vectors (e.g. 0.5, 0.5, 0).
+
+2.1.4. Compliance:
+   2.1.4.1. Each association is assigned \(Z_i \in \{\text{control}, \text{T1}, \text{T2}\}\).  
+   2.1.4.2. Actual treatment status \(D_i\) can differ from \(Z_i\) if take-up is less than 1.  
+   2.1.4.3. In the current baseline configuration:  
+       2.1.4.3.1. `take_up["control"] = 0`.  
+       2.1.4.3.2. `take_up["T1"] = 1`.  
+       2.1.4.3.3. `take_up["T2"] = 1`, so that \(D_i = Z_i\) for treated arms and \(D_i = 0\) in control.  
+   2.1.4.4. This design supports:  
+       2.1.4.4.1. Intention-to-treat (ITT) estimands based on assignment \(Z_i\).  
+       2.1.4.4.2. Treatment-on-the-treated (TOT) estimands using 2SLS, where feasible.
+
+2.1.5. Stratification:
+   2.1.5.1. Each association has stratification covariates:  
+       2.1.5.1.1. `ngo_id` (e.g. implementing partner).  
+       2.1.5.1.2. `tribe_id` (social/cultural context).  
+       2.1.5.1.3. `year_in_program` (exposure/experience with H4H).  
+   2.1.5.2. These can be used:  
+       2.1.5.2.1. For stratified randomization of treatment assignment.  
+       2.1.5.2.2. As sources of systematic treatment-effect heterogeneity in the DGP.
+
+## 2.2 Tagging and Measurement Intensity
+
+2.2.1. Per association, a subset of cows is tagged and observed:
+   2.2.1.1. `cows_tagged_per_association` is the key design variable swept in the power exercise.  
+   2.2.1.2. Tagged cows are sampled uniformly at random without replacement from the association’s population of size `cows_per_association`.  
+   2.2.1.3. Only tagged cows appear in the event- and month-level simulated dataset.
+
+2.2.2. Interpretation:
+   2.2.2.1. `cows_per_association` represents the actual herd size per association (simplified as fixed across associations).  
+   2.2.2.2. `cows_tagged_per_association` represents measurement intensity.  
+   2.2.2.3. Random tagging ensures that, conditional on the DGP, the tagged subsample is an unbiased representation of the association-level distribution of cow outcomes.
+
+2.2.3. Efficient implementation:
+   2.2.3.1. The simulation engine avoids explicitly simulating the full 300-cow population in memory when only a subset is tagged.  
+   2.2.3.2. Instead:  
+       2.2.3.2.1. A full ID frame \(\{1, \ldots, \text{cows\_per\_association}\}\) is defined per association.  
+       2.2.3.2.2. `cows_tagged_per_association` IDs are drawn at random.  
+       2.2.3.2.3. All random effects and outcome trajectories are generated only for these tagged cows.
+
+2.2.4. Caveat:
+   2.2.4.1. The current design assumes tagging is random.  
+   2.2.4.2. If in the field high-value animals or particular owners are more likely to be tagged, the DGP would need to incorporate non-random selection and potential selection bias.
+
+## 2.3 Time Structure and Events
+
+2.3.1. Time dimension:
+   2.3.1.1. Each tagged cow is followed for `months_T` months (default 12).  
+   2.3.1.2. Within each month, there are `events_per_month_E` tracking “events” (default 30, one per day), which you can interpret as days or day-night episodes.
+
+2.3.2. Indexing:
+   2.3.2.1. Associations: \(i = 1,\ldots,N\).  
+   2.3.2.2. Cows within association \(i\): \(j = 1,\ldots,n_i\) (where \(n_i = \text{cows\_tagged\_per\_association}\)).  
+   2.3.2.3. Months: \(t = 1,\ldots,T\).  
+   2.3.2.4. Events (within month): \(e = 1,\ldots,E\).
+
+2.3.3. Event-level outcomes are simulated at the \((i,j,t,e)\) level and can be aggregated to the month level for analysis (depending on `analysis_mode`).
+   2.3.3.3.1. If `analysis_mode = "month"`, outcomes are averaged over events within month \(t\) for each cow \(j\) in association \(i\).
+   2.3.3.3.2. If `analysis_mode = "event"`, outcomes are analyzed at the full event level.
+
+## 2.4 Outcomes
+
+2.4.1. The DGP supports multiple outcome families, aligned with plausible tracking-derived metrics.
+
+2.4.2. Continuous, strictly positive event-level outcomes (log-normal on the link scale):
+   2.4.2.1. Distance traveled, \(Y^{\text{distance}}_{ijte}\) (km per event).  
+   2.4.2.2. Resting time, \(Y^{\text{resting}}_{ijte}\) (minutes per event).  
+   2.4.2.3. Time in pasture, \(Y^{\text{pasture}}_{ijte}\) (minutes per event).  
+   2.4.2.4. Time at home, \(Y^{\text{home}}_{ijte}\) (minutes per event).
+
+2.4.3. Binary event-level outcomes (logistic link):
+   2.4.3.1. `left_morning`: indicator that the cow left for the field during the morning segment.  
+   2.4.3.2. `left_night`: indicator that the cow left for the field during the night segment.
+
+2.4.4. Baseline (control) means on the link scale are specified in the configuration `mu_baseline`:
+   2.4.4.1. Continuous:  
+       2.4.4.1.1. \(\log\) distance: `log(3.0)` km per event.  
+       2.4.4.1.2. \(\log\) resting time: `log(60.0)` minutes.  
+       2.4.4.1.3. \(\log\) pasture time: `log(120.0)` minutes.  
+       2.4.4.1.4. \(\log\) home time: `log(180.0)` minutes.  
+   2.4.4.2. Binary:  
+       2.4.4.2.1. `left_morning`: logit of 0.90 (high probability of leaving in the morning).  
+       2.4.4.2.2. `left_night`: logit of 0.10 (low baseline probability of night movement).
+
+2.4.5. Outcome selection:
+   2.4.5.1. For a given simulation sweep, the engine focuses on a single “primary” outcome indicated by `config$outcome_selected`.  
+   2.4.5.2. In the current master script, the focus is on `outcome_selected = "left_night"`.  
+
+## 2.5 Random Effects and Correlation Structure
+
+2.5.1. The DGP is multi-level, with random components at:
+   2.5.1.1. Association level (cluster).  
+   2.5.1.2. Cow level (within cluster).  
+   2.5.1.3. Time series level (within cow across months and within-month events).
+
+2.5.2. Association-level random intercepts:
+   2.5.2.1. Each association has a random intercept \(u_i \sim \mathcal{N}(0, \sigma^2_{\text{assoc}})\) on the link scale.  
+   2.5.2.2. Default `sigma_assoc = 0.25`.
+
+2.5.3. Cow-level random intercepts:
+   2.5.3.1. Each cow \(j\) in association \(i\) has a random effect \(v_{ij} \sim \mathcal{N}(0, \sigma^2_{\text{cow}})\).  
+   2.5.3.2. Default `sigma_cow = 0.25`.  
+   2.5.3.3. This captures persistent unobserved heterogeneity across cows (e.g. cow health, temperament).
+
+2.5.4. Temporal autocorrelation (AR(1)):
+
+   The engine implements two nested AR(1) components for each cow and outcome: a slower-moving month-level process and a finer-grained event-level process. Both enter the link-scale linear predictor additively.
+
+   2.5.4.1. Month-level AR(1) across months (slower component):
+      2.5.4.1.1. \(m_{ij1} \sim \mathcal{N}(0, \sigma^2_{\text{month}} / (1 - \rho_{\text{month}}^2))\).
+      2.5.4.1.2. \(m_{ij,t} = \rho_{\text{month}}\, m_{ij,t-1} + \nu_{ij,t}\) for \(t > 1\), with \(\nu_{ij,t} \sim \mathcal{N}(0, \sigma^2_{\text{month}})\).
+
+   2.5.4.2. Event-level AR(1) across events within cow (finer component):
+      2.5.4.2.1. Index events within cow by a global event time \(s = 1,\ldots, T\cdot E\). The event-level AR series is:
+      2.5.4.2.2. \(e_{ij1} \sim \mathcal{N}(0, \sigma^2_{\text{ar}} / (1 - \rho_{\text{ar1}}^2))\),
+      2.5.4.2.3. \(e_{ij,s} = \rho_{\text{ar1}}\, e_{ij,s-1} + \epsilon_{ij,s}\) for \(s > 1\), with \(\epsilon_{ij,s} \sim \mathcal{N}(0, \sigma^2_{\text{ar}})\).
+
+   2.5.4.3. Defaults and notes:
+      2.5.4.3.1. `rho_ar1 = 0.5` and `sigma_ar = 0.5` (event-level defaults).
+      2.5.4.3.2. The month-level parameters default to `rho_month = 0` and `sigma_month = 0` (disabled unless set in `config`).
+      2.5.4.3.3. Together the month-level term \(m_{ij,t}\) (applied to all events in month \(t\)) and the event-level term \(e_{ij,s}\) produce persistence both across months and between adjacent events: an event outcome influences the next event via the event-level AR(1), while month-level trends create slower-moving shifts across all events in a month.
+
+2.5.5. Heterogeneous treatment effects:
+   2.5.5.1. Treatment effects are allowed to vary systematically with association-level stratifiers:  
+       2.5.5.1.1. NGO ID.  
+       2.5.5.1.2. Tribe ID.  
+       2.5.5.1.3. Year in program.  
+   2.5.5.2. For each arm and stratifier, there is a random treatment-effect component with mean zero and variance (all on the link scale):  
+       2.5.5.2.1. `het_var_ngo`.  
+       2.5.5.2.2. `het_var_tribe`.  
+       2.5.5.2.3. `het_var_year`.  
+   2.5.5.3. Defaults: 0.5 for each of these variance terms, implying substantial between-context heterogeneity in treatment impacts.
+
+## 2.6 Treatment Effects on Outcomes
+
+2.6.1. For continuous outcomes, treatment effects are specified as multiplicative factors relative to control:
+   2.6.1.1. For arm \(a \in \{\text{T1}, \text{T2}\}\) the effect multiplier is `effect_mult[a]`.  
+   2.6.1.2. In the current setup:  
+       2.6.1.2.1. `effect_mult["T1"] = 1.05`.  
+       2.6.1.2.2. `effect_mult["T2"] = 1.20`.  
+   2.6.1.3. On the log scale, this corresponds to adding \(\log(\text{effect\_mult[a]})\) to the linear predictor.
+
+2.6.2. For binary outcomes, treatment effects are implemented on the probability scale (percent change), not as odds ratios.
+   2.6.2.1. The engine first assembles a link-scale linear predictor \(\eta_{ijte} = \mu_{\text{baseline}} + u_i + v_{ij} + m_{ijt} + e_{ijte} + \dots\) as described in Section 2.5.
+   2.6.2.2. The baseline probability under control is computed as \(p^{(0)}_{ijte} = \operatorname{logit}^{-1}(\eta_{ijte})\).
+   2.6.2.3. The user-specified `effect_mult[a]` is interpreted as a multiplicative factor on this baseline probability for treated observations. For a treated unit the simulated probability becomes
+   \[ p^{(1)}_{ijte} = \operatorname{clamp}\big(p^{(0)}_{ijte} \times \text{effect\_mult}[a] + \tau_i,\; 0,\; 1\big), \]
+   where \(\tau_i\) denotes optional additive heterogeneity by association (the code records this in the run metadata) and clamp() enforces the \([0,1]\) bounds.
+   2.6.2.4. In practice, `effect_mult = 1.05` means "+5% of the baseline probability": for baseline 0.90 the treated probability would be ≈0.945 before clipping. This is intentionally different from odds-ratio scaling; the engine records the DGP choice (probability-scale multiplier) in the meta CSV so downstream consumers know how to interpret `effect_mult`.
+
+2.6.3. The full linear predictor for a given outcome is assembled from:
+   2.6.3.1. \(\mu_{\text{baseline}}\) — the baseline intercept on the link scale (log or logit depending on outcome).
+   2.6.3.2. Association-level random intercept \(u_i\sim N(0,\sigma^2_{\text{assoc}})\) and cow-level random intercept \(v_{ij}\sim N(0,\sigma^2_{\text{cow}})\).
+   2.6.3.3. Two additive temporal AR(1) components per cow: a month-level AR(1) \(m_{ijt}\) (slower-moving across months) and an event-level AR(1) \(e_{ijte}\) (finer-grained across events within month). The engine sums these components on the link scale before converting to a baseline probability for binary outcomes.
+   2.6.3.4. For binary outcomes the baseline probability is computed as \(p^{(0)}_{ijte} = \operatorname{logit}^{-1}(\mu_{\text{baseline}} + u_i + v_{ij} + m_{ijt} + e_{ijte})\). Treatment is then applied multiplicatively on this probability as described above.
+
+2.6.4. The event-level outcome is then drawn from the appropriate distribution:
+   2.6.4.1. For binary outcomes: draw \(Y_{ijte} \sim \mathrm{Bernoulli}(p_{ijte})\) where \(p_{ijte}\) follows the baseline → treatment procedure above (probability-scale multiplier + optional additive heterogeneity and clipping).
+   2.6.4.2. For continuous outcomes: the engine uses a log-link multiplicative DGP (log-normal-like) where the linear predictor is exponentiated to produce the event-level mean; additional iid noise can be added if configured.
+
+## 2.7 Missingness
+
+1. The DGP allows for independent missingness at the cow-month level:
+   1.1. Each cow-month observation is dropped with probability `missingness_p_cow_month`.  
+   1.2. Default is 0, so no missingness is induced in the baseline simulations.
+
+2. Extensions:
+   2.1. Non-ignorable missingness patterns (e.g. device failure correlated with movement intensity) could be encoded with additional structure if needed for sensitivity analysis.
+
+# 3. Simulation and Estimation Design
+
+## 3.1 Monte Carlo Structure
+
+1. The power simulation is a Monte Carlo exercise over designs and realizations of the DGP:
+   1.1. Fix a design vector \(\theta\) that includes:
+       1.1.1. Number of associations \(N\) and their allocation to treatment arms.  
+       1.1.2. Number of tagged cows per association \(n_i\) (with \(n_i = n\) in the symmetric case).  
+       1.1.3. Time horizon \(T\) and events per month \(E\).  
+   1.1.4. Variance components and treatment effects \((\sigma_{\text{assoc}}^2, \sigma_{\text{cow}}^2, \rho_{\text{ar1}}, \sigma_{\text{ar}}^2, \rho_{\text{month}}, \sigma_{\text{month}}^2, \text{OR}_a)\).  
+   1.2. For each design \(\theta\), define a Monte Carlo size `sims = S`.  
+
+2. For each simulation \(s = 1,\dots,S\) and each value of `cows_tagged_per_association` in the sweep:
+   2.1. Draw treatment assignments \(\{Z_i^{(s)}\}\) according to the specified allocation probabilities.  
+   2.2. Derive actual treatment statuses \(\{D_i^{(s)}\}\) given take-up rates.  
+   2.3. Simulate the full multi-level DGP for tagged cows:
+       2.3.1. Association- and cow-level random effects.  
+       2.3.2. AR(1) time series components.  
+       2.3.3. Event-level outcomes \(\{Y_{ijte}^{(s)}\}\).  
+   2.4. Aggregate event-level outcomes to the chosen analysis level (month or event).  
+   2.5. Estimate treatment effects \(\hat{\beta}_a^{(s)}\) using the specified estimator.  
+   2.6. Compute the associated test statistic \(T^{(s)}_a\) and indicator of rejection:
+       \[
+       I^{(s)}_a = \mathbf{1} \left( \lvert T^{(s)}_a \rvert > c_{1-\alpha/2} \right),
+       \]
+       where \(c_{1-\alpha/2}\) is the critical value for a two-sided test at level \(\alpha\).  
+
+3. Empirical power for arm \(a\) under design \(\theta\) and sample size configuration is:
+   3.1. \[
+        \hat{\pi}_a(\theta) = \frac{1}{S} \sum_{s=1}^S I^{(s)}_a,
+        \]
+        which converges to the true power \(\pi_a(\theta)\) as \(S \to \infty\).  
+
+4. Monte Carlo settings in the current configuration:
+   4.1. `sims = 100` is used as a smoke test; in applied design work, \(S\) should be increased (e.g., \(S \geq 500\)).  
+   4.2. `alpha = 0.05` is the nominal size of the two-sided test used to define power.  
+
+5. Parallelization:
+   5.1. The master script uses:
+       5.1.1. `plan(multisession, workers = 12)` to parallelize across cores.  
+       5.1.2. `parallel_layer = "outer"` in the call to `simulate_cattle_power`, which parallelizes across sweep values and/or Monte Carlo repetitions.  
+   5.2. Progress is monitored via `progressr`, with a terminal-friendly progress bar.
+
+## 3.2 Analysis Mode and Aggregation
+
+1. The engine supports two analysis modes that determine how \(\{Y_{ijte}\}\) are mapped to analysis datasets:
+
+   1.1. `analysis_mode = "month"` (current default):  
+       1.1.1. Event-level data are aggregated to cow–month summaries.  
+       1.1.2. For continuous outcomes, `month_aggregate_mode = "sum"` or `"mean"` determines the aggregation operator:
+             1.1.2.1. \(\tilde{Y}_{ijt}^{\text{sum}} = \sum_{e=1}^E Y_{ijte}\).  
+             1.1.2.2. \(\tilde{Y}_{ijt}^{\text{mean}} = \frac{1}{E} \sum_{e=1}^E Y_{ijte}\).  
+       1.1.3. For binary outcomes, aggregation can be handled via:
+             1.1.3.1. Monthly counts \(C_{ijt} = \sum_{e=1}^E Y_{ijte}\).  
+             1.1.3.2. Monthly proportions \(P_{ijt} = C_{ijt}/E\).  
+
+   1.2. `analysis_mode = "event"`:  
+       1.2.1. Each event \((i,j,t,e)\) is treated as an observation.  
+       1.2.2. Estimation then uses appropriate clustering at least at the association level and possibly at the cow level.
+
+2. In the current baseline configuration:
+   2.1. `analysis_mode = "month"`.  
+   2.2. `month_aggregate_mode = "sum"`.  
+   2.3. The primary outcome is the monthly count of `left_night` events per cow, \(C_{ijt}\).
+
+## 3.3 Estimands and Estimators
+
+1. Primary estimands are average treatment effects for each active arm relative to control on the chosen outcome.
+
+   1.1. ITT for arm \(a \in \{\text{T1}, \text{T2}\}\):
+       \[
+            \beta^{\text{ITT}}_a = \mathbb{E}\left[ Y_i(Z_i = a) - Y_i(Z_i = 0) \right],
+       \]
+       where \(Y_i(\cdot)\) is the association-level mean outcome under assignment.
+
+   1.2. Under full take-up (as in the baseline configuration), \(\beta^{\text{ITT}}_a\) coincides with the average effect of treatment status because \(D_i = Z_i\).
+
+2. Estimators implemented in the engine:
+
+   2.1. ITT — Linear regression (lm) of the outcome on arm indicators and month fixed effects. For continuous outcomes this is applied to log-transformed outcomes (log-link DGP); for binary outcomes the engine uses a linear probability model (LPM) so coefficients are differences in probabilities (percentage points).
+
+   2.2. TOT — Instrumental-variables regression (AER::ivreg) using assignment indicators as instruments for actual treatment receipt D. The code fits linear IV models so TOT estimates are on the same scale as the ITT (probability scale for binary outcomes when the LPM is used).
+
+   2.3. The engine fits these models at the analysis level (event or month) and includes month fixed effects as configured. Additional covariates or stratifier controls can be added through the `config` object if desired.
+
+3. Standard errors and inference:
+
+   3.1. When `cluster_se = TRUE`, standard errors are clustered at the association level; the engine uses `sandwich::vcovCL` for cluster-robust covariances.
+
+   3.2. If cluster vcov computation fails (e.g., tiny samples or numerical issues), the engine falls back to heteroskedasticity-robust HC-type vcov (configurable via `hc_type`). This defensive behavior prevents small-sample failures from aborting large Monte Carlo runs.
+
+4. Hypothesis tests and power computation:
+
+   4.1. For each estimator and arm the engine constructs Wald-type tests using the chosen robust/clustered vcov matrix and computes p-values.
+
+   4.2. Empirical power is estimated by the Monte Carlo proportion of simulations in which the two-sided test rejects at level `alpha`.
+
+## 3.4 Sweep over `cows_tagged_per_association`
+
+1. The core design question is examined via a sweep in the master script:
+   1.1. The call is:
+   ```r
+   out <- simulate_cattle_power(
+     config,
+     sweep_param = "cows_tagged_per_association",
+     sweep_values = c(1, seq(from = 5, to = 155, by = 25)),
+     sweep_each_arm = FALSE,
+     parallel_layer = "outer",
+     outfile_stem = "cattle_power_left_night",
+     seed = 42
+   )
+   ```
+   1.2. This evaluates power for:
+       1.2.1. 1 tagged cow per association.  
+       1.2.2. 5, 30, 55, 80, 105, 130, and 155 tagged cows per association.
+
+2. For each sweep value:
+   2.1. The configuration is updated with the new `cows_tagged_per_association`.  
+   2.2. `sims = S` complete Monte Carlo runs are executed.  
+   2.3. Power is computed for each arm–estimator combination and stored in:
+       2.3.1. A wide CSV summarizing power as a function of `cows_tagged_per_association`.  
+       2.3.2. A long “tidy” CSV with one row per arm–estimator–sweep value.  
+       2.3.3. PNG and PDF figures displaying power curves.
+
+3. Outputs:
+   3.1. The function returns a list whose entries include:
+      3.1.1. `csv`: path to the wide power table (summary per sweep value).
+      3.1.2. `long_csv`: path to the tidy power table (canonical artifact: one row per series × sweep value). The engine reads this file back when producing figures so it is the single source of truth for downstream plotting and reporting.
+      3.1.3. `meta_csv`: companion key/value metadata CSV describing all run settings and DGP choices (e.g. whether binary effects were applied on the probability scale). An Excel workbook (`.xlsx`) with sheets for `long` and `meta` is written when `writexl` is available.
+      3.1.4. `png`, `pdf`: paths to power curve figures (generated from the `long_csv`).
+   3.2. The master script prints these paths to the console and then resets the parallel plan to `sequential`. If you want to regenerate figures later, use the provided `regenerate_figs_from_csv.R` script which reads the `*_long.csv` and writes updated PNG/PDF files into `output/cattle/figs/`.
+
+# 4. Interpretation: Why Power Increases with Tagging (and Why It Saturates)
+
+## 4.1 Conceptual Decomposition
+
+1. In a cluster-randomized design with cluster-robust SEs, power is primarily driven by:
+   1.1. Number of clusters \(N\) and their allocation across arms.  
+   1.2. Cluster-level variability in outcomes and treatment effects.  
+   1.3. Within-cluster sample size \(n_i\) (here, `cows_tagged_per_association`).  
+   1.4. Intra-cluster correlation (ICC), which links individual-level variance to cluster-level variance.  
+
+2. For a generic outcome at the cow level, suppose:
+   2.1. \(Y_{ij} = \mu + u_i + \epsilon_{ij}\), with:
+       2.1.1. \(u_i \sim \mathcal{N}(0, \sigma_u^2)\) (association-level variation).  
+       2.1.2. \(\epsilon_{ij} \sim \mathcal{N}(0, \sigma^2_\epsilon)\) (idiosyncratic variation).  
+   2.2. The intra-cluster correlation coefficient (ICC) is:
+       2.2.1. \[
+            \rho = \frac{\sigma_u^2}{\sigma_u^2 + \sigma_\epsilon^2}.
+            \]
+
+3. The variance of the cluster mean \(\bar{Y}_i = \frac{1}{n_i}\sum_j Y_{ij}\) is:
+   3.1. \[
+        \text{Var}(\bar{Y}_i) = \sigma_u^2 + \frac{\sigma_\epsilon^2}{n_i},
+        \]
+        which can be written as:
+        3.1.1. \[
+             \text{Var}(\bar{Y}_i) = \sigma^2 \left[ \rho + \frac{1 - \rho}{n_i} \right],
+             \]
+             where \(\sigma^2 = \sigma_u^2 + \sigma_\epsilon^2\).
+
+4. Key implications:
+   4.1. Increasing \(n_i\) reduces the \(\frac{1 - \rho}{n_i}\) component, decreasing \(\text{Var}(\bar{Y}_i)\).  
+   4.2. As \(n_i \to \infty\), \(\text{Var}(\bar{Y}_i) \to \sigma^2 \rho = \sigma_u^2\): the variance is then dominated by between-association heterogeneity.  
+   4.3. Therefore, power gains from increasing \(n_i\) are largest when \(n_i\) is small and diminish as \(n_i\) becomes large.
+
+5. In the simulation:
+   5.1. The multi-level structure (association, cow, AR(1) over time) preserves this general logic but with richer dynamics.  
+   5.2. The sweep over `cows_tagged_per_association` effectively maps out how quickly we move from a regime where within-association sampling variance matters to one where between-association variance dominates.
+
+## 4.2 Diminishing Returns
+
+1. Because the number of clusters \(N\) and the variance components are held fixed across the sweep, increasing `cows_tagged_per_association` only affects the within-cluster precision of \(\bar{Y}_i\).
+
+2. At low tagging intensities:
+   2.1. The variance term \(\frac{1 - \rho}{n_i}\) is relatively large.  
+   2.2. Small increases in \(n_i\) substantially reduce \(\text{Var}(\bar{Y}_i)\).  
+   2.3. This translates into noticeable reductions in standard errors of estimated treatment effects and thus higher power.
+
+3. At moderate to high tagging intensities:
+   3.1. The within-cluster term \(\frac{1 - \rho}{n_i}\) becomes small compared to the between-cluster term \(\rho\).  
+   3.2. Further increases in \(n_i\) have marginal effects on \(\text{Var}(\bar{Y}_i)\).  
+   3.3. Power becomes constrained by the finite number of clusters and the magnitude of between-association heterogeneity.
+
+4. As a result, the empirical power curves as a function of `cows_tagged_per_association` tend to:
+   4.1. Rise steeply between a very small number of tagged cows (e.g., from 1 to 5 or 10).  
+   4.2. Flatten progressively as tagging approaches a large fraction of the herd (e.g., tagging 100+ cows out of 300).
+
+## 4.3 Population vs. Sample within Association
+
+1. It is important to distinguish:
+   1.1. `cows_per_association` \(= M\): the underlying herd size (simplified as constant across associations).  
+   1.2. `cows_tagged_per_association` \(= n_i\): the subset of animals we actually observe.
+
+2. In the DGP:
+   2.1. Random effects and heterogeneity are defined as if the full population of \(M\) cows exists.  
+   2.2. The simulation then draws a simple random sample of \(n_i\) cows to tag:
+       2.2.1. This determines which individual-level trajectories \(\{Y_{ijte}\}\) are generated and included in estimation.  
+
+3. As `cows_tagged_per_association` approaches `cows_per_association`:
+   3.1. The tagged subset converges to a census of the herd.  
+   3.2. Within-association sampling error becomes negligible.  
+   3.3. Power is then almost entirely governed by the cluster-level design: \(N\), effect sizes, and between-association variation.
+
+4. In practice:
+   4.1. The objective is to choose `cows_tagged_per_association` in the region where:
+       4.1.1. The majority of attainable power (given \(N\)) has already been captured.  
+       4.1.2. Additional tags would yield relatively small marginal gains in power, given their cost.
+
+# 5. Extensions, Limitations, and Use in Design
+
+## 5.1 Extensions
+
+1. Alternative sweeps and design parameters:
+
+   1.1. Number of associations (`n_associations`):
+       1.1.1. Vary \(N\) to study the tradeoff between:
+             1.1.1.1. Adding new associations (expanding the experimental frame).  
+             1.1.1.2. Tagging more cows within existing associations.  
+
+   1.2. Effect sizes (`effect_mult`):
+       1.2.1. Vary the multiplicative effects or odds ratios to compute minimum detectable effects (MDEs) for given choices of \(N\) and `cows_tagged_per_association`.  
+
+   1.3. Variance components:
+       1.3.1. Explore sensitivity to alternative assumptions for:
+             1.3.1.1. \(\sigma_{\text{assoc}}^2\), \(\sigma_{\text{cow}}^2\).  
+             1.3.1.2. Temporal correlation parameters \((\rho_{\text{ar1}}, \sigma^2_{\text{ar}})\).  
+             1.3.1.3. Heterogeneity variances (`het_var_ngo`, `het_var_tribe`, `het_var_year`).  
+
+2. Alternative outcomes:
+
+   2.1. The engine can set `outcome_selected` to any of the tracking-derived metrics:
+       2.1.1. Distance traveled.  
+       2.1.2. Resting time.  
+       2.1.3. Time in pasture.  
+       2.1.4. Time at home.  
+       2.1.5. `left_morning`.  
+       2.1.6. `left_night`.  
+
+   2.2. Each outcome may exhibit different ICCs and variance structures, leading to different power curves as a function of tagging intensity and \(N\).
+
+3. Non-random tagging:
+
+   3.1. To approximate field realities where tagging is not purely random, one could:
+       3.1.1. Introduce correlation between cow-level random effects and selection into tagging (e.g., higher-value cows more likely to be tagged).  
+       3.1.2. Model the selection rule explicitly, with a propensity to be tagged depending on covariates and/or treatment.  
+       3.1.3. Examine the bias and variance of ITT/TOT estimators under such non-random tagging.
+
+4. Integration with remote sensing and ecological plots:
+
+   4.1. Tracking outcomes can be used as:
+       4.1.1. Intermediate variables linking rotational grazing plans to observed changes in vegetation or soil metrics.  
+       4.1.2. Validation or calibration inputs for remote-sensing-based measures of grazing pressure and rest periods.  
+
+## 5.2 Limitations
+
+1. No explicit spatial layout:
+
+   1.1. The current DGP encodes high-frequency behavioral outcomes but does not model explicit spatial trajectories (e.g., GPS coordinates or paths).  
+   1.2. For design questions focused on scalar outcomes (e.g., probability of night movement, distance walked), this is sufficient.  
+   1.3. For analyses that require spatial patterns (e.g., overlap with sensitive habitats, distance to water sources), the model would need to be extended.
+
+2. Simplified herd structure:
+
+   2.1. The within-association herd is modeled as a homogeneous population of cows.  
+   2.2. The model does not distinguish between:
+       2.2.1. Different age/sex classes (e.g., calves vs adult cows vs bulls).  
+       2.2.2. Different species (e.g., cows vs sheep vs goats).  
+   2.3. This is acceptable for the narrow objective of tag-based power calculations but not for detailed livestock emission inventories or demographic analyses.
+
+3. Monte Carlo precision:
+
+   3.1. The baseline script uses `sims = 6` as a smoke test.  
+   3.2. In practice, to ensure stable power estimates:
+       3.2.1. `sims` should be increased significantly (e.g., \(S \geq 500\) or 1,000).  
+       3.2.2. Computational resources (cores, memory) must be scaled accordingly.
+
+4. Specification risk:
+
+   4.1. Power results are conditional on assumed effect sizes and variance components.  
+   4.2. If these assumptions are far from the true data-generating process in the field:
+       4.2.1. Actual power may differ substantially.  
+       4.2.2. Sensitivity analysis over plausible parameter ranges is important.
+
+## 5.3 How to Use the Results in the Biltong / GRASS Design
+
+1. Mapping power curves to budget and logistics:
+
+   1.1. For each candidate level of `cows_tagged_per_association`:
+       1.1.1. Extract empirical power for `left_night` and any other primary tracking outcomes.  
+       1.1.2. Map this to an approximate per-association cost of tagging and maintaining that number of devices.  
+
+   1.2. Choose a design that:
+       1.2.1. Achieves at least the target power threshold (e.g., \(\hat{\pi}_a \geq 0.8\)) for key hypotheses.  
+       1.2.2. Respects budgetary and operational constraints in the Biltong / GRASS program.
+
+2. Coordination with other measurement streams:
+
+   2.1. Tracking is one component of a broader monitoring and evaluation system, which also includes:
+       2.1.1. Ecological plots and vegetation measurements.  
+       2.1.2. Remote sensing products (e.g., biomass, bare ground, fire scars).  
+       2.1.3. Household and herder surveys (socioeconomic outcomes, perceptions, compliance).  
+
+   2.2. The tracking power analysis should be read jointly with:
+       2.2.1. Power analyses for ecological outcomes (e.g., biomass or ground cover).  
+       2.2.2. Power analyses for socioeconomic outcomes (e.g., income, herd health indicators).  
+
+3. Iterative refinement using pilot data:
+
+   3.1. As pilot deployments of tracking devices generate real data:
+       3.1.1. Estimate empirical variance components and ICCs from the observed \(\{Y_{ijte}\}\).  
+       3.1.2. Compare to the assumed parameters in the current DGP.  
+       3.1.3. Update the configuration `config` accordingly.
+
+   3.2. Re-run the power simulations with updated parameters to:
+       3.2.1. Refine tagging targets for the full RCT.  
+       3.2.2. Assess whether the experimental design remains adequate or should be adjusted (e.g., by changing \(N\), follow-up length \(T\), or measurement intensity).
+
+4. Positioning within the broader impact evaluation strategy:
+
+   4.1. The tracking-based power exercise helps clarify:
+       4.1.1. How much individual-level movement data are needed to credibly detect changes in key behavioral outcomes.  
+       4.1.2. Where tracking adds unique value relative to more traditional monitoring tools.  
+
+   4.2. Combined with other components (e.g., SOC, fire management, enteric emissions), this supports the design of a coherent, multi-outcome impact evaluation of H4H-style interventions under the Biltong / GRASS program.
+

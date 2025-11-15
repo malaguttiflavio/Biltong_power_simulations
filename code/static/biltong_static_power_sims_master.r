@@ -40,14 +40,14 @@ if (!dir.exists(tabs_dir)) dir.create(tabs_dir, recursive = TRUE)
 if (!dir.exists(figs_dir)) dir.create(figs_dir, recursive = TRUE)
 
 # ------------------------------ Specify Scenario ------------------------------ #
-n_communities            <- 130
+n_communities            <- 160
 avg_ind_obs_per_comm     <- 100
 sd_indiv_per_comm        <- 10
 soc_outcome_baseline_pct <- 0.35 # x% of the individual in the community are counted 
 assoc_area               <- 2000
 base_fire_avg_pct        <- 0.2 
 base_fire_sd_pct         <- 0.1
-arm_mode                 <- "Single"  # change to "Mult" to use the multi-arm parameters below
+arm_mode                 <- "Mult"  # change to "Mult" to use the multi-arm parameters below
 
 config <- list(
 
@@ -89,14 +89,14 @@ config <- list(
   # Multi-arm parameters
   arms_multi                  = c("control","T1","T2"),
   alloc_ratios_multi          = c(control = 0.34, T1 = 0.33, T2 = 0.33),
-  take_up_multi               = c(control = 0.05, T1 = 0.50, T2 = 0.85),
-  soc_outcome_ate_pct_multi   = c(T1 = 1.20, T2 = 1.45),
+  take_up_multi               = c(control = 0.00, T1 = 1.00, T2 = 1.00),
+  soc_outcome_ate_pct_multi   = c(T1 = 1.05, T2 = 1.45),
   env_outcome_ate_multi       = c(T1 = 10,  T2 = 10),        # Per-arm additive effects on environmental outcome (omit 'control')
   
   # Socioeconomic outcome parameters: log and counts
   soc_outcome_T         = 3,                            # Number of time points for socio-economic outcome
   soc_outcome_T_months  = c(1,6,12),                    # Timeline (in months) for socio-economic observations
-  soc_outcome_dist      = "negbin",                    # Distribution for socio-economic ("poisson","negbin","none" for deterministic)
+  soc_outcome_dist      = "negbin",                     # Distribution for socio-economic ("poisson","negbin","none" for deterministic)
   soc_outcome_base_mean = avg_ind_obs_per_comm * soc_outcome_baseline_pct, # Base expected outcome mean per cluster
   soc_outcome_theta     = 6,                            # Dispersion parameter for negative binomial distribution, doesnt matter for others
   soc_outcome_ICC       = 0.05,                         # Intra-cluster correlation for socio-economic outcome
@@ -137,41 +137,153 @@ config$stratify_exact <- TRUE
 
   
 # ------------------------------ Run Simulations (separate sweeps) ------------------------------ #
-# 1) Socio-economic: sweep over soc_outcome_ate_pct_single
-out_soc <- simulate_power(
-  config,
-  sweep_param    = "soc_outcome_ate_pct_single",
-  sweep_arm      = NULL,    # If NULL, sweeps all arms
-  sweep_each_arm = TRUE,
-  sweep_values   = seq(1.05, 1.4, by = 0.05),
-  parallel_layer = "inner",
-  seed = 123,
-  
-)
+# Toggle to also run the original single-scenario sweeps (kept for reference)
+run_baseline_sweeps <- FALSE
+# Note on sweep_param keys (single vs multi arm):
+# - We consistently use the multi-arm keys ("soc_outcome_ate_pct_multi", "env_outcome_ate_multi").
+# - The engine auto-resolves to the appropriate container based on your config: if only a single
+#   treatment arm is present, it maps the sweep to the single-arm container; with multiple arms,
+#   it uses the multi-arm container.
+# - This lets the same master script work unchanged for both single- and multi-arm scenarios.
+# - With sweep_each_arm = TRUE, the engine runs independent sweeps per treatment arm.
 
-cat("Socio-economic sweep artifacts:\n",
-    out_soc$csv, "\n",
-    out_soc$long_csv, "\n",
-    out_soc$soc_outcome_png, "\n",
-    out_soc$soc_outcome_pdf, "\n")
+if (isTRUE(run_baseline_sweeps)) {
+  # 1) Socio-economic: sweep over soc_outcome_ate_pct_multi
+  out_soc <- simulate_power(
+    config,
+    sweep_param    = "soc_outcome_ate_pct_multi",
+    sweep_arm      = NULL,    # If NULL, sweeps all arms
+    sweep_each_arm = TRUE,
+    sweep_values   = seq(1.05, 1.4, by = 0.05),
+    parallel_layer = "inner",
+    seed = 123
+  )
 
-# 2) Environmental: sweep over env_outcome_ate_single
-out_env <- simulate_power(
-  config,
-  sweep_param    = "env_outcome_ate_single",
-  sweep_arm      = NULL,
-  sweep_each_arm = TRUE,
-  sweep_values   = seq(5, 30, by = 5),
-  parallel_layer = "inner",
-  seed = 456,
-  
-)
+  cat("Socio-economic sweep artifacts:\n",
+      out_soc$csv, "\n",
+      out_soc$long_csv, "\n",
+      out_soc$soc_outcome_png, "\n",
+      out_soc$soc_outcome_pdf, "\n")
 
-cat("Environmental sweep artifacts:\n",
-    out_env$csv, "\n",
-    out_env$long_csv, "\n",
-    out_env$env_outcome_png, "\n",
-    out_env$env_outcome_pdf, "\n")
+  # 2) Environmental: sweep over env_outcome_ate_multi
+  out_env <- simulate_power(
+    config,
+    # Use multi-arm key universally; engine auto-resolves to single- or multi- container as needed
+    sweep_param    = "env_outcome_ate_multi",
+    sweep_arm      = NULL,
+    sweep_each_arm = TRUE,
+    sweep_values   = seq(5, 30, by = 5),
+    parallel_layer = "inner",
+    seed = 456
+  )
+
+  cat("Environmental sweep artifacts:\n",
+      out_env$csv, "\n",
+      out_env$long_csv, "\n",
+      out_env$env_outcome_png, "\n",
+      out_env$env_outcome_pdf, "\n")
+}
+
+# ------------------------------ Sensitivity Grid (ICC × AR1 × theta) ------------------------------ #
+# We vary: ICC (applied to both outcomes), AR1 rho (applied to both outcomes), and theta
+# (dispersion for Negative Binomial) which applies only to socio-economic outcome.
+# Assumptions:
+# - We set soc_outcome_dist = "negbin" so theta is relevant; adjust values below as needed.
+# - The same ICC and AR1 values are used for both outcomes for each scenario.
+
+power_target <- 0.80   # Target power for MDE computation
+
+# Define small grids (edit as needed)
+icc_vals   <- c(0.02, 0.05, 0.10)
+ar1_vals   <- c(0.20, 0.50, 0.80)
+theta_vals <- c(4, 6, 10)
+
+# Ensure NEGBIN is used for socio-economic outcome when running the grid
+config$soc_outcome_dist <- "negbin"
+
+grid <- expand.grid(ICC = icc_vals, AR1 = ar1_vals, theta = theta_vals, KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
+
+compute_mde <- function(long_df, target_power = 0.80) {
+  # long_df expected columns: outcome, estimator, arm, sweep_value, power
+  long_df %>%
+    dplyr::filter(!is.na(arm)) %>%
+    dplyr::group_by(outcome, estimator, arm) %>%
+    dplyr::summarise(
+      MDE = {
+        v <- sweep_value[power >= target_power]
+        if (length(v) == 0) NA_real_ else min(v, na.rm = TRUE)
+      },
+      .groups = "drop"
+    )
+}
+
+mde_accum <- list()
+
+for (i in seq_len(nrow(grid))) {
+  scn <- grid[i, ]
+
+  # Scenario-tag for filenames (safe for paths): replace '.' with 'p'
+  fmt_num <- function(x) gsub("\\.", "p", sprintf("%.3f", x))
+  tag <- glue::glue("ICC{fmt_num(scn$ICC)}_AR1{fmt_num(scn$AR1)}_theta{fmt_num(scn$theta)}")
+
+  config_scn <- config
+  # Apply scenario parameters
+  config_scn$soc_outcome_ICC     <- scn$ICC
+  config_scn$env_outcome_ICC     <- scn$ICC
+  config_scn$soc_outcome_AR1_rho <- scn$AR1
+  config_scn$env_outcome_AR1_rho <- scn$AR1
+  config_scn$soc_outcome_theta   <- scn$theta
+  config_scn$soc_outcome_dist    <- "negbin"
+
+  # Socio-economic sweep (multiplicative ATEs)
+  out_soc <- simulate_power(
+    config_scn,
+    sweep_param    = "soc_outcome_ate_pct_multi",
+    sweep_arm      = NULL,
+    sweep_each_arm = TRUE,
+    sweep_values   = seq(1.05, 1.40, by = 0.05),
+    parallel_layer = "inner",
+    seed = 123,
+    outfile_stem   = glue::glue("biltong_power_{tag}")
+  )
+
+  # Environmental sweep (additive ATEs)
+  out_env <- simulate_power(
+    config_scn,
+    sweep_param    = "env_outcome_ate_multi",
+    sweep_arm      = NULL,
+    sweep_each_arm = TRUE,
+    sweep_values   = seq(5, 30, by = 5),
+    parallel_layer = "inner",
+    seed = 456,
+    outfile_stem   = glue::glue("biltong_power_{tag}")
+  )
+
+  # Read long tables for MDE computation (structure is stable and convenient)
+  soc_long <- tryCatch(readr::read_csv(out_soc$long_csv, show_col_types = FALSE), error = function(e) NULL)
+  env_long <- tryCatch(readr::read_csv(out_env$long_csv, show_col_types = FALSE), error = function(e) NULL)
+
+  mde_soc <- if (!is.null(soc_long)) compute_mde(soc_long, target_power = power_target) else dplyr::tibble()
+  mde_env <- if (!is.null(env_long)) compute_mde(env_long, target_power = power_target) else dplyr::tibble()
+
+  mde_scn <- dplyr::bind_rows(mde_soc, mde_env) %>%
+    dplyr::mutate(
+      scenario_id = tag,
+      ICC = scn$ICC,
+      AR1 = scn$AR1,
+      theta = scn$theta
+    ) %>%
+    dplyr::relocate(scenario_id, ICC, AR1, theta)
+
+  mde_accum[[length(mde_accum) + 1]] <- mde_scn
+}
+
+if (length(mde_accum) > 0) {
+  mde_all <- dplyr::bind_rows(mde_accum)
+  mde_outfile <- file.path(tabs_dir, "biltong_power_sensitivity_mde.csv")
+  readr::write_csv(mde_all, mde_outfile)
+  cat("Saved aggregated MDE table to:\n", mde_outfile, "\n")
+}
 
 # ------------------------------ Cleanup ------------------------------ #
 plan(sequential)

@@ -423,11 +423,21 @@ simulate_dynamic_power <- function(
     pivot_longer(cols = starts_with("power_"), names_to = "arm", values_to = "power") |>
     mutate(arm = sub("^power_", "", arm))
 
+  # Labels per request
+  arms_label <- if (length(config$trt_arms) > 1) "multi" else "single"
+  design_label <- paste0(config$randomize_at, ", T=", config$T_periods)
+  dist_label <- "normal"
+
   plt <- ggplot(melt, aes(x = sweep_value, y = power, color = arm, linetype = arm)) +
     geom_line(linewidth = 1) +
     geom_point() +
     scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
-    labs(x = sweep_param, y = "Power", title = glue("Adaptive targeting: power vs {sweep_param} (T={config$T_periods})")) +
+    labs(
+      x = sweep_param,
+      y = "Power",
+      title = glue::glue("Power for different {sweep_param}"),
+      subtitle = glue::glue("Design: {design_label} | Distribution: {dist_label} | Arms: {arms_label}")
+    ) +
     theme_minimal(base_size = 12)
   png_path <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}.png"))
   pdf_path <- file.path(figs_dir, glue::glue("{outfile_stem}_{sweep_param}.pdf"))
