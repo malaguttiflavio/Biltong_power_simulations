@@ -1,0 +1,1 @@
+import delimited "/Users/flavioamalagutti/Documents/Work/GitHub/Research_Projects/Biltong/Simulations/Biltong_power_simulations/output/cattle/tabs/cattle_power_cows_tagged_left_morning_last_sim_data.csv", clear

@@ -44,31 +44,31 @@ wald_contrast <- function(fit, R, r = 0, cluster = NULL, hc_type = "HC1") {
   # Align contrast to vcov/coef names; drop any terms not present
   if (is.null(vn)) {
     # Fallback: dimensions must match; otherwise return NA
-    if (length(R) != length(b) || nrow(V) != length(b)) return(list(stat = NA_real_, p = NA_real_))
+    if (length(R) != length(b) || nrow(V) != length(b)) return(list(stat = NA_real_, p = NA_real_, diff = NA_real_))
   } else {
     # Keep only entries present in both R and V/b
     if (!is.null(names(R))) {
       keep <- intersect(vn, names(R))
-      if (length(keep) == 0) return(list(stat = NA_real_, p = NA_real_))
+      if (length(keep) == 0) return(list(stat = NA_real_, p = NA_real_, diff = NA_real_))
       vn <- keep
       b  <- b[keep]
       V  <- V[keep, keep, drop = FALSE]
       R  <- R[keep]
     } else {
       # Unnamed R; require matching length
-      if (length(R) != length(b) || nrow(V) != length(b)) return(list(stat = NA_real_, p = NA_real_))
+      if (length(R) != length(b) || nrow(V) != length(b)) return(list(stat = NA_real_, p = NA_real_, diff = NA_real_))
     }
   }
   # Guard: singular or empty
   if (length(R) == 0 || any(!is.finite(R)) || any(!is.finite(b)) || any(!is.finite(V))) {
-    return(list(stat = NA_real_, p = NA_real_))
+    return(list(stat = NA_real_, p = NA_real_, diff = NA_real_))
   }
   num <- sum(R * b) - r
   den <- tryCatch(as.numeric(t(matrix(R, ncol = 1)) %*% V %*% matrix(R, ncol = 1)), error = function(e) NA_real_)
-  if (!is.finite(den) || den <= 0) return(list(stat = NA_real_, p = NA_real_))
+  if (!is.finite(den) || den <= 0) return(list(stat = NA_real_, p = NA_real_, diff = NA_real_))
   stat <- (num^2) / den
   p <- 1 - pchisq(stat, df = 1)
-  list(stat = stat, p = p)
+  list(stat = stat, p = p, diff = num)
 }
 
 # Palette helper
@@ -140,21 +140,22 @@ simulate_cattle_power <- function(
   eff_mult <- config$effect_mult # named by treatment arms (exclude control)
   if (is.null(eff_mult)) eff_mult <- setNames(rep(1, length(arms) - 1), arms[-1])
 
-  # Heterogeneity variances (link-scale)
-  het_var <- list(
-    ngo = config$het_var_ngo %||% 0,
-    tribe = config$het_var_tribe %||% 0,
-    year = config$het_var_year %||% 0
+  # Stratifier baseline variance (link-scale)
+  strat_var <- list(
+    ngo = config$strat_sigma_ngo %||% config$het_var_ngo %||% 0,
+    tribe = config$strat_sigma_tribe %||% config$het_var_tribe %||% 0,
+    year = config$strat_sigma_yr %||% config$het_var_year %||% 0
   )
 
-  # Variance components
-  sigma_assoc <- config$sigma_assoc %||% 0.2
-  sigma_cow   <- config$sigma_cow   %||% 0.2
-  rho_ar1     <- config$rho_ar1     %||% 0.5
-  sigma_ar    <- config$sigma_ar    %||% 0.5
-  # Optional month-level AR(1) (across months per cow). Defaults to 0 (disabled).
-  rho_month   <- config$rho_month   %||% 0
-  sigma_month <- config$sigma_month %||% 0
+  # Variance components (ICC components)
+  sigma_assoc <- config$icc_sigma_assoc %||% config$sigma_assoc %||% 0.2
+  sigma_cow   <- config$icc_sigma_cow   %||% config$sigma_cow   %||% 0.2
+  
+  # AR(1) temporal components
+  rho_ar1     <- config$ar1_cow_event_rho   %||% config$rho_ar1     %||% 0.5
+  sigma_ar    <- config$ar1_cow_event_sigma %||% config$sigma_ar    %||% 0.5
+  rho_month   <- config$ar1_cow_month_rho   %||% config$rho_month   %||% 0
+  sigma_month <- config$ar1_cow_month_sigma %||% config$sigma_month %||% 0
 
   # Missingness
   p_miss <- config$missingness_p_cow_month %||% 0
@@ -166,6 +167,7 @@ simulate_cattle_power <- function(
   sims  <- config$sims  %||% 300
   hc_type <- config$hc_type %||% "HC1"
   cluster_se <- isTRUE(config$cluster_se %||% TRUE)
+  estimate_tot <- isTRUE(config$estimate_tot %||% TRUE)  # Whether to run TOT (IV) estimations
 
   # Output dirs (relative to repo structure using static conventions)
   script_dir <- tryCatch(dirname(normalizePath(sys.frame(1)$ofile)), error = function(e) getwd())
@@ -205,32 +207,31 @@ simulate_cattle_power <- function(
       ungroup()
 
     # Build full event panel for tagged cows
-    # Build panel inherits columns from assoc_df (including arm and stratifiers) via assoc_tbl
-    # Avoid re-joining 'arm' to prevent duplicate columns (arm.x/arm.y). Only join extra stratifiers if needed.
-    panel <- build_event_panel(assoc_tbl = assoc_df, cows_tagged_per_assoc = cows_tagged_local, months_T = months_T_local, events_per_month_E = events_E_local) |>
-      left_join(assoc_df |> select(association_id, ngo_id, tribe_id, year_in_program), by = "association_id")
+    # Panel inherits all columns from assoc_df (including arm and stratifiers ngo_id, tribe_id, year_in_program)
+    panel <- build_event_panel(assoc_tbl = assoc_df, cows_tagged_per_assoc = cows_tagged_local, months_T = months_T_local, events_per_month_E = events_E_local)
 
     # Cow random intercepts
     cow_re <- cow_map |>
-      mutate(u_cow = rnorm(n(), 0, sigma_cow)) |>
-      select(association_id, cow_id, u_cow)
+      mutate(comp_cow = rnorm(n(), 0, sigma_cow)) |>
+      select(association_id, cow_id, comp_cow)
 
     # Association random intercepts
     assoc_re <- assoc_df |>
-      transmute(association_id, u_assoc = rnorm(n(), 0, sigma_assoc))
+      transmute(association_id, comp_assoc = rnorm(n(), 0, sigma_assoc))
 
-    # Heterogeneity by strata on link scale (per association, then applied to treated D=1)
-    tau_strata <- assoc_df |>
+    # Stratifier-based level shifts (baseline heterogeneity, not treatment effect heterogeneity)
+    # Each association gets a baseline shift based on its NGO, tribe, and year characteristics
+    strata_baseline <- assoc_df |>
       transmute(
         association_id,
-        tau_strata = rnorm(n(), 0, sqrt(het_var$ngo)) + rnorm(n(), 0, sqrt(het_var$tribe)) + rnorm(n(), 0, sqrt(het_var$year))
+        comp_strata = rnorm(n(), 0, sqrt(strat_var$ngo)) + rnorm(n(), 0, sqrt(strat_var$tribe)) + rnorm(n(), 0, sqrt(strat_var$year))
       )
 
     # Merge random components
     panel <- panel |>
       left_join(cow_re,  by = c("association_id","cow_id")) |>
       left_join(assoc_re, by = "association_id") |>
-      left_join(tau_strata, by = "association_id")
+      left_join(strata_baseline, by = "association_id")
 
     # Take-up at cow-month (default equals 1 for treated arms, 0 for control)
     # Construct D at event level via join from cow-month mapping
@@ -279,34 +280,32 @@ simulate_cattle_power <- function(
 
       # Build components on link scale (without treatment)
       comp_mu0   <- rep(mu0, nrow(panel))
-      comp_assoc <- panel$u_assoc
-      comp_cow   <- panel$u_cow
+      comp_assoc <- panel$comp_assoc
+      comp_cow   <- panel$comp_cow
       comp_ar_event <- panel$e_ar
       comp_ar_month <- panel$month_ar
       comp_ar <- comp_ar_event + comp_ar_month
+      comp_strata <- panel$comp_strata  # Baseline shift from NGO/tribe/year (affects all units)
 
-      # Linear predictor without treatment effect
-      linpred_no_trt <- comp_mu0 + comp_assoc + comp_cow + comp_ar
-      baseline_p <- inv_logit_clamp(linpred_no_trt)
-
-      # Treatment effects are applied multiplicatively on the probability scale.
+      # Treatment effects are applied multiplicatively on the probability scale to mu0 ONLY.
       # User-specified eff_mult gives the multiplier (e.g., 1.05 = +5%).
-      # Heterogeneity (tau_strata) is applied as an additive shift on the probability scale
-      # and only affects treated observations (D == 1). We clip final probabilities to [0,1].
+      # Random components (assoc, cow, AR, strata) are added on link scale AFTER treatment is applied to mu0.
       trt_mult_map <- setNames(rep(1, length(arms)), arms)
       for (a in setdiff(arms, "control")) trt_mult_map[[a]] <- eff_mult[[a]] %||% 1
 
-      # Apply multiplier then additive heterogeneity (tau_strata stored per association)
+      # Step 1: Apply treatment multiplier to baseline mean probability (from mu0 only)
+      p_mu0 <- inv_logit_clamp(comp_mu0)  # Baseline probability from mu0
       comp_mult_effect <- trt_mult_map[panel$arm]
-      # Ensure comp_mult_effect is numeric vector aligned with panel rows
       comp_mult_effect <- as.numeric(comp_mult_effect)
-      # Additive heterogeneity per association (assumed to be on probability scale)
-      comp_tau_add <- panel$tau_strata
-
-      # Compute observed probability: baseline for control, baseline * multiplier + additive tau for treated
-      comp_prob <- ifelse(panel$D == 1, baseline_p * comp_mult_effect + comp_tau_add, baseline_p)
-      # Clip probabilities to [0, 1]
-      comp_prob <- pmin(pmax(comp_prob, 0), 1)
+      p_mu0_treated <- p_mu0 * comp_mult_effect  # Treatment multiplies ONLY mu0's probability
+      p_mu0_treated <- pmin(pmax(p_mu0_treated, 0), 1)  # Clip to [0,1]
+      
+      # Step 2: Convert treated mu0 back to link scale, then add random components
+      mu0_treated_link <- logit_clamp(p_mu0_treated)
+      linpred_full <- mu0_treated_link + comp_assoc + comp_cow + comp_ar + comp_strata
+      
+      # Final probability
+      comp_prob <- inv_logit_clamp(linpred_full)
 
       y_event <- rbinom(nrow(panel), 1L, comp_prob)
 
@@ -314,14 +313,15 @@ simulate_cattle_power <- function(
         mutate(
           y = y_event,
           comp_mu0 = comp_mu0,
+          comp_mu0_treated = mu0_treated_link,  # mu0 after treatment applied (logit scale)
           comp_assoc = comp_assoc,
           comp_cow = comp_cow,
           comp_ar = comp_ar,
-          comp_tau = comp_tau_add * D, # show tau only when applied
+          comp_strata = comp_strata,  # Baseline shift from stratifiers (affects all units)
           comp_trt = comp_mult_effect * D,
-          comp_linpred = linpred_no_trt,
+          comp_linpred = linpred_full,
           comp_prob = comp_prob,
-          baseline_prob = baseline_p
+          baseline_prob = p_mu0  # Baseline from mu0 only (before random components)
         )
     } else {
       # Log-normal multiplicative effects (log-link)
@@ -329,15 +329,18 @@ simulate_cattle_power <- function(
       for (a in setdiff(arms, "control")) mult_map[[a]] <- eff_mult[[a]] %||% 1
 
       comp_mu0   <- rep(mu0, nrow(panel))
-      comp_assoc <- panel$u_assoc
-      comp_cow   <- panel$u_cow
-  comp_ar_event    <- panel$e_ar
-  comp_ar_month    <- panel$month_ar
-  comp_ar          <- comp_ar_event + comp_ar_month
-      comp_tau   <- panel$tau_strata * panel$D
+      comp_assoc <- panel$comp_assoc
+      comp_cow   <- panel$comp_cow
+      comp_ar_event    <- panel$e_ar
+      comp_ar_month    <- panel$month_ar
+      comp_ar          <- comp_ar_event + comp_ar_month
+      comp_strata <- panel$comp_strata  # Baseline shift from NGO/tribe/year (affects all units)
       comp_trt   <- log(mult_map[panel$arm]) * panel$D
+      
+      # For continuous outcomes, treatment is added on log scale, so mu0_treated = mu0 + comp_trt
+      comp_mu0_treated <- comp_mu0 + comp_trt
 
-      linpred <- comp_mu0 + comp_assoc + comp_cow + comp_ar + comp_tau + comp_trt
+      linpred <- comp_mu0 + comp_assoc + comp_cow + comp_ar + comp_strata + comp_trt
       comp_expected_mean <- exp(linpred)
       y_event <- comp_expected_mean # no extra iid noise beyond AR(1); adjust if needed
 
@@ -345,10 +348,11 @@ simulate_cattle_power <- function(
         mutate(
           y = y_event,
           comp_mu0 = comp_mu0,
+          comp_mu0_treated = comp_mu0_treated,  # mu0 after treatment applied (log scale)
           comp_assoc = comp_assoc,
           comp_cow = comp_cow,
           comp_ar = comp_ar,
-          comp_tau = comp_tau,
+          comp_strata = comp_strata,  # Baseline shift from stratifiers (affects all units)
           comp_trt = comp_trt,
           comp_linpred = linpred,
           comp_expected_mean = comp_expected_mean
@@ -356,18 +360,29 @@ simulate_cattle_power <- function(
     }
 
     # Aggregate to month if needed and prepare analysis frame
+    # Ensure stratifier columns are present (they should be inherited from panel via assoc_df join)
+    if (!all(c("ngo_id", "tribe_id", "year_in_program") %in% names(df))) {
+      # If missing (edge case), add them back from association mapping
+      df <- df |>
+        left_join(
+          assoc_df |> select(association_id, ngo_id, tribe_id, year_in_program),
+          by = "association_id"
+        )
+    }
+    
     if (analysis_mode == "month") {
       if (is_binary) {
         dfm <- df |>
-          group_by(association_id, cow_id, month_index, arm) |>
+          group_by(association_id, cow_id, month_index, arm, ngo_id, tribe_id, year_in_program) |>
           summarise(
             y = mean(y),
             D = mean(D),
             comp_mu0 = mean(comp_mu0),
+            comp_mu0_treated = mean(comp_mu0_treated),
             comp_assoc = mean(comp_assoc),
             comp_cow = mean(comp_cow),
             comp_ar = mean(comp_ar),
-            comp_tau = mean(comp_tau),
+            comp_strata = mean(comp_strata),
             comp_trt = mean(comp_trt),
             comp_linpred = mean(comp_linpred),
             comp_prob = mean(comp_prob),
@@ -375,15 +390,16 @@ simulate_cattle_power <- function(
           )
       } else if (agg_mode_cont == "mean") {
         dfm <- df |>
-          group_by(association_id, cow_id, month_index, arm) |>
+          group_by(association_id, cow_id, month_index, arm, ngo_id, tribe_id, year_in_program) |>
           summarise(
             y = mean(y),
             D = mean(D),
             comp_mu0 = mean(comp_mu0),
+            comp_mu0_treated = mean(comp_mu0_treated),
             comp_assoc = mean(comp_assoc),
             comp_cow = mean(comp_cow),
             comp_ar = mean(comp_ar),
-            comp_tau = mean(comp_tau),
+            comp_strata = mean(comp_strata),
             comp_trt = mean(comp_trt),
             comp_linpred = mean(comp_linpred),
             comp_expected_mean = mean(comp_expected_mean),
@@ -391,15 +407,16 @@ simulate_cattle_power <- function(
           )
       } else { # sum
         dfm <- df |>
-          group_by(association_id, cow_id, month_index, arm) |>
+          group_by(association_id, cow_id, month_index, arm, ngo_id, tribe_id, year_in_program) |>
           summarise(
             y = sum(y),
             D = mean(D),
             comp_mu0 = mean(comp_mu0),
+            comp_mu0_treated = mean(comp_mu0_treated),
             comp_assoc = mean(comp_assoc),
             comp_cow = mean(comp_cow),
             comp_ar = mean(comp_ar),
-            comp_tau = mean(comp_tau),
+            comp_strata = mean(comp_strata),
             comp_trt = mean(comp_trt),
             comp_linpred = mean(comp_linpred),
             comp_expected_mean = mean(comp_expected_mean),
@@ -407,11 +424,23 @@ simulate_cattle_power <- function(
           )
       }
       df_use <- dfm |>
-        mutate(month_f = factor(month_index), assoc_f = factor(association_id))
+        mutate(
+          month_f = factor(month_index), 
+          assoc_f = factor(association_id),
+          ngo_f = factor(ngo_id),
+          tribe_f = factor(tribe_id),
+          year_f = factor(year_in_program)
+        )
     } else {
       # Event-level analysis; add factors directly
       df_use <- df |>
-        mutate(month_f = factor(month_index), assoc_f = factor(association_id))
+        mutate(
+          month_f = factor(month_index), 
+          assoc_f = factor(association_id),
+          ngo_f = factor(ngo_id),
+          tribe_f = factor(tribe_id),
+          year_f = factor(year_in_program)
+        )
     }
 
     # Arm indicators (control vs T1 vs T2)
@@ -425,90 +454,124 @@ simulate_cattle_power <- function(
     # Construct multi-arm treatment receipt indicators based on actual D; fallback if missing
     if (!"D" %in% names(df_use)) df_use <- df_use |> mutate(D = any_treat)
     df_use <- df_use |>
-      mutate(D1 = D * Z_T1, D2 = D * Z_T2, Z1 = Z_T1, Z2 = Z_T2)
+      mutate(D1 = D * Z_T1, D2 = D * Z_T2)
 
     # ITT models
     if (is_binary && analysis_mode == "event") {
       # LPM at event level
-      fit_itt <- lm(y ~ Z_T1 + Z_T2 + month_f, data = df_use)
+      fit_itt <- lm(y ~ Z_T1 + Z_T2 + month_f + ngo_f + tribe_f + year_f, data = df_use)
     } else if (is_binary && analysis_mode == "month") {
-      fit_itt <- lm(y ~ Z_T1 + Z_T2 + month_f, data = df_use)
+      fit_itt <- lm(y ~ Z_T1 + Z_T2 + month_f + ngo_f + tribe_f + year_f, data = df_use)
     } else {
       # Continuous: log transform for stability
       y_tr <- log(pmax(df_use$y, 1e-8))
-      fit_itt <- lm(y_tr ~ Z_T1 + Z_T2 + month_f, data = df_use)
+      fit_itt <- lm(y_tr ~ Z_T1 + Z_T2 + month_f + ngo_f + tribe_f + year_f, data = df_use)
     }
 
   cluster <- df_use$association_id
   vc <- get_vcov(fit_itt, cluster = if (cluster_se) cluster else NULL, hc_type = hc_type)
     ct <- lmtest::coeftest(fit_itt, vcov. = vc)
 
-    # Extract p-values for T1 vs C, T2 vs C, and T1 vs T2 (ITT)
+    # Extract p-values and coefficient estimates for T1 vs C, T2 vs C, and T1 vs T2 (ITT)
     pv_T1 <- tryCatch(ct["Z_T1", "Pr(>|t|)"], error = function(e) NA_real_)
+    beta_T1 <- tryCatch(ct["Z_T1", "Estimate"], error = function(e) NA_real_)
     pv_T2 <- tryCatch(ct["Z_T2", "Pr(>|t|)"], error = function(e) NA_real_)
+    beta_T2 <- tryCatch(ct["Z_T2", "Estimate"], error = function(e) NA_real_)
     # T1 - T2 contrast
     R <- rep(0, length(coef(fit_itt))); names(R) <- names(coef(fit_itt))
     if ("Z_T1" %in% names(R)) R["Z_T1"] <- 1
     if ("Z_T2" %in% names(R)) R["Z_T2"] <- -1
     wt <- wald_contrast(fit_itt, R = R, r = 0, cluster = cluster)
     pv_T1T2 <- wt$p
+    beta_T1T2 <- wt$diff  # Coefficient difference (T1 - T2)
 
-    # TOT models using actual treatment receipt
-
-    # T1 vs Control sample
-    df_T1C <- df_use |>
-      filter(arm %in% c("control", arms[2])) |>
-      mutate(Z = as.integer(arm == arms[2]))
-    if (nrow(df_T1C) > 0) {
-      if (is_binary) {
-        fit_tot_T1 <- AER::ivreg(y ~ D + month_f | Z + month_f, data = df_T1C)
-      } else {
-        y_tr_T1 <- log(pmax(df_T1C$y, 1e-8))
-        fit_tot_T1 <- AER::ivreg(y_tr_T1 ~ D + month_f | Z + month_f, data = df_T1C)
-      }
-  vc1 <- get_vcov(fit_tot_T1, cluster = if (cluster_se) df_T1C$association_id else NULL, hc_type = hc_type)
-      ct1 <- lmtest::coeftest(fit_tot_T1, vcov. = vc1)
-      pv_tot_T1 <- tryCatch(ct1["D", "Pr(>|t|)"], error = function(e) NA_real_)
-    } else pv_tot_T1 <- NA_real_
-
-    # T2 vs Control sample (if exists)
-    if (length(arms) >= 3) {
-      df_T2C <- df_use |>
-        filter(arm %in% c("control", arms[3])) |>
-        mutate(Z = as.integer(arm == arms[3]))
-      if (nrow(df_T2C) > 0) {
+    # TOT models using actual treatment receipt (only if estimate_tot = TRUE)
+    if (estimate_tot) {
+      # T1 vs Control sample
+      df_T1C <- df_use |>
+        filter(arm %in% c("control", arms[2])) |>
+        mutate(Z = as.integer(arm == arms[2]))
+      if (nrow(df_T1C) > 0) {
         if (is_binary) {
-          fit_tot_T2 <- AER::ivreg(y ~ D + month_f | Z + month_f, data = df_T2C)
+          fit_tot_T1 <- AER::ivreg(y ~ D + month_f + ngo_f + tribe_f + year_f | Z + month_f + ngo_f + tribe_f + year_f, data = df_T1C)
         } else {
-          y_tr_T2 <- log(pmax(df_T2C$y, 1e-8))
-          fit_tot_T2 <- AER::ivreg(y_tr_T2 ~ D + month_f | Z + month_f, data = df_T2C)
+          y_tr_T1 <- log(pmax(df_T1C$y, 1e-8))
+          fit_tot_T1 <- AER::ivreg(y_tr_T1 ~ D + month_f + ngo_f + tribe_f + year_f | Z + month_f + ngo_f + tribe_f + year_f, data = df_T1C)
         }
-  vc2 <- get_vcov(fit_tot_T2, cluster = if (cluster_se) df_T2C$association_id else NULL, hc_type = hc_type)
-        ct2 <- lmtest::coeftest(fit_tot_T2, vcov. = vc2)
-        pv_tot_T2 <- tryCatch(ct2["D", "Pr(>|t|)"], error = function(e) NA_real_)
-      } else pv_tot_T2 <- NA_real_
-    } else pv_tot_T2 <- NA_real_
+        vc1 <- get_vcov(fit_tot_T1, cluster = if (cluster_se) df_T1C$association_id else NULL, hc_type = hc_type)
+        ct1 <- lmtest::coeftest(fit_tot_T1, vcov. = vc1)
+        pv_tot_T1 <- tryCatch(ct1["D", "Pr(>|t|)"], error = function(e) NA_real_)
+        beta_tot_T1 <- tryCatch(ct1["D", "Estimate"], error = function(e) NA_real_)
+      } else {
+        pv_tot_T1 <- NA_real_
+        beta_tot_T1 <- NA_real_
+      }
 
-    # Joint multi-arm TOT across full sample: y ~ D1 + D2 + FE | Z1 + Z2 + FE
-    if (is_binary) {
-      fit_tot_joint <- AER::ivreg(y ~ D1 + D2 + month_f | Z1 + Z2 + month_f, data = df_use)
+      # T2 vs Control sample (if exists)
+      if (length(arms) >= 3) {
+        df_T2C <- df_use |>
+          filter(arm %in% c("control", arms[3])) |>
+          mutate(Z = as.integer(arm == arms[3]))
+        if (nrow(df_T2C) > 0) {
+          if (is_binary) {
+            fit_tot_T2 <- AER::ivreg(y ~ D + month_f + ngo_f + tribe_f + year_f | Z + month_f + ngo_f + tribe_f + year_f, data = df_T2C)
+          } else {
+            y_tr_T2 <- log(pmax(df_T2C$y, 1e-8))
+            fit_tot_T2 <- AER::ivreg(y_tr_T2 ~ D + month_f + ngo_f + tribe_f + year_f | Z + month_f + ngo_f + tribe_f + year_f, data = df_T2C)
+          }
+          vc2 <- get_vcov(fit_tot_T2, cluster = if (cluster_se) df_T2C$association_id else NULL, hc_type = hc_type)
+          ct2 <- lmtest::coeftest(fit_tot_T2, vcov. = vc2)
+          pv_tot_T2 <- tryCatch(ct2["D", "Pr(>|t|)"], error = function(e) NA_real_)
+          beta_tot_T2 <- tryCatch(ct2["D", "Estimate"], error = function(e) NA_real_)
+        } else {
+          pv_tot_T2 <- NA_real_
+          beta_tot_T2 <- NA_real_
+        }
+      } else {
+        pv_tot_T2 <- NA_real_
+        beta_tot_T2 <- NA_real_
+      }
+
+      # Joint multi-arm TOT across full sample: y ~ D1 + D2 + FE | Z_T1 + Z_T2 + FE
+      if (is_binary) {
+        fit_tot_joint <- AER::ivreg(y ~ D1 + D2 + month_f + ngo_f + tribe_f + year_f | Z_T1 + Z_T2 + month_f + ngo_f + tribe_f + year_f, data = df_use)
+      } else {
+        y_tr_joint <- log(pmax(df_use$y, 1e-8))
+        fit_tot_joint <- AER::ivreg(y_tr_joint ~ D1 + D2 + month_f + ngo_f + tribe_f + year_f | Z_T1 + Z_T2 + month_f + ngo_f + tribe_f + year_f, data = df_use)
+      }
+      vcj <- get_vcov(fit_tot_joint, cluster = if (cluster_se) df_use$association_id else NULL, hc_type = hc_type)
+      ctj <- lmtest::coeftest(fit_tot_joint, vcov. = vcj)
+      pv_totJ_T1 <- tryCatch(ctj["D1", "Pr(>|t|)"], error = function(e) NA_real_)
+      beta_totJ_T1 <- tryCatch(ctj["D1", "Estimate"], error = function(e) NA_real_)
+      pv_totJ_T2 <- tryCatch(ctj["D2", "Pr(>|t|)"], error = function(e) NA_real_)
+      beta_totJ_T2 <- tryCatch(ctj["D2", "Estimate"], error = function(e) NA_real_)
     } else {
-      y_tr_joint <- log(pmax(df_use$y, 1e-8))
-      fit_tot_joint <- AER::ivreg(y_tr_joint ~ D1 + D2 + month_f | Z1 + Z2 + month_f, data = df_use)
+      # Skip TOT estimation - set all TOT results to NA
+      pv_tot_T1 <- NA_real_
+      beta_tot_T1 <- NA_real_
+      pv_tot_T2 <- NA_real_
+      beta_tot_T2 <- NA_real_
+      pv_totJ_T1 <- NA_real_
+      beta_totJ_T1 <- NA_real_
+      pv_totJ_T2 <- NA_real_
+      beta_totJ_T2 <- NA_real_
     }
-  vcj <- get_vcov(fit_tot_joint, cluster = if (cluster_se) df_use$association_id else NULL, hc_type = hc_type)
-    ctj <- lmtest::coeftest(fit_tot_joint, vcov. = vcj)
-    pv_totJ_T1 <- tryCatch(ctj["D1", "Pr(>|t|)"], error = function(e) NA_real_)
-    pv_totJ_T2 <- tryCatch(ctj["D2", "Pr(>|t|)"], error = function(e) NA_real_)
 
     pvals <- tibble(
       p_itt_T1_vs_C = pv_T1,
+      beta_itt_T1_vs_C = beta_T1,
       p_itt_T2_vs_C = pv_T2,
+      beta_itt_T2_vs_C = beta_T2,
       p_itt_T1_vs_T2 = pv_T1T2,
+      beta_itt_T1_vs_T2 = beta_T1T2,
       p_tot_T1_vs_C = pv_tot_T1,
+      beta_tot_T1_vs_C = beta_tot_T1,
       p_tot_T2_vs_C = pv_tot_T2,
+      beta_tot_T2_vs_C = beta_tot_T2,
       p_tot_joint_T1_vs_C = pv_totJ_T1,
-      p_tot_joint_T2_vs_C = pv_totJ_T2
+      beta_tot_joint_T1_vs_C = beta_totJ_T1,
+      p_tot_joint_T2_vs_C = pv_totJ_T2,
+      beta_tot_joint_T2_vs_C = beta_totJ_T2
     )
     if (isTRUE(capture_data)) {
       return(list(pvals = pvals, df = df_use, outcome = outcome_selected))
@@ -564,15 +627,53 @@ simulate_cattle_power <- function(
     }
 
     dfp <- bind_rows(sim_res)
+    
+    # Signed power: count simulations where effect is statistically significant AND in the correct direction
+    # Direction is determined by config$expected_direction parameter:
+    # - "positive": effect_mult > 1.0 should give positive coefficients
+    # - "negative": effect_mult > 1.0 should give negative coefficients (treatment reduces outcome)
+    # - "auto": determine from effect_mult values (> 1.0 = positive, < 1.0 = negative)
+    
+    expected_direction <- cfg_local$expected_direction %||% "auto"
+    
+    # Get expected effect multipliers for this sweep configuration
+    eff_mult_T1 <- if (!is.null(which_arm) && which_arm == "T1") val else cfg_local$effect_mult["T1"]
+    eff_mult_T2 <- if (!is.null(which_arm) && which_arm == "T2") val else cfg_local$effect_mult["T2"]
+    
+    # Determine expected signs based on expected_direction setting
+    if (expected_direction == "positive") {
+      # Treatment increases outcome: effect_mult > 1.0 means positive coefficient
+      expect_positive_T1 <- eff_mult_T1 > 1.0
+      expect_positive_T2 <- eff_mult_T2 > 1.0
+    } else if (expected_direction == "negative") {
+      # Treatment decreases outcome: effect_mult > 1.0 means negative coefficient
+      # (e.g., effect_mult = 1.1 means outcome becomes 1.1× larger in absence, so treatment effect is negative)
+      expect_positive_T1 <- eff_mult_T1 < 1.0
+      expect_positive_T2 <- eff_mult_T2 < 1.0
+    } else {
+      # "auto": infer from effect_mult values
+      expect_positive_T1 <- eff_mult_T1 > 1.0
+      expect_positive_T2 <- eff_mult_T2 > 1.0
+    }
+    # For T1 vs T2 contrast: positive if T1 > T2 (regardless of direction setting)
+    expect_positive_T1T2 <- eff_mult_T1 > eff_mult_T2
+    
     tibble(
       sweep_value = val,
-      power_itt_T1_vs_C = mean(dfp$p_itt_T1_vs_C < alpha, na.rm = TRUE),
-      power_itt_T2_vs_C = mean(dfp$p_itt_T2_vs_C < alpha, na.rm = TRUE),
-      power_itt_T1_vs_T2 = mean(dfp$p_itt_T1_vs_T2 < alpha, na.rm = TRUE),
-      power_tot_T1_vs_C = mean(dfp$p_tot_T1_vs_C < alpha, na.rm = TRUE),
-      power_tot_T2_vs_C = mean(dfp$p_tot_T2_vs_C < alpha, na.rm = TRUE),
-      power_tot_joint_T1_vs_C = mean(dfp$p_tot_joint_T1_vs_C < alpha, na.rm = TRUE),
-      power_tot_joint_T2_vs_C = mean(dfp$p_tot_joint_T2_vs_C < alpha, na.rm = TRUE)
+      power_itt_T1_vs_C = mean(dfp$p_itt_T1_vs_C < alpha & 
+                                 (dfp$beta_itt_T1_vs_C > 0) == expect_positive_T1, na.rm = TRUE),
+      power_itt_T2_vs_C = mean(dfp$p_itt_T2_vs_C < alpha & 
+                                 (dfp$beta_itt_T2_vs_C > 0) == expect_positive_T2, na.rm = TRUE),
+      power_itt_T1_vs_T2 = mean(dfp$p_itt_T1_vs_T2 < alpha & 
+                                  (dfp$beta_itt_T1_vs_T2 > 0) == expect_positive_T1T2, na.rm = TRUE),
+      power_tot_T1_vs_C = mean(dfp$p_tot_T1_vs_C < alpha & 
+                                 (dfp$beta_tot_T1_vs_C > 0) == expect_positive_T1, na.rm = TRUE),
+      power_tot_T2_vs_C = mean(dfp$p_tot_T2_vs_C < alpha & 
+                                 (dfp$beta_tot_T2_vs_C > 0) == expect_positive_T2, na.rm = TRUE),
+      power_tot_joint_T1_vs_C = mean(dfp$p_tot_joint_T1_vs_C < alpha & 
+                                       (dfp$beta_tot_joint_T1_vs_C > 0) == expect_positive_T1, na.rm = TRUE),
+      power_tot_joint_T2_vs_C = mean(dfp$p_tot_joint_T2_vs_C < alpha & 
+                                       (dfp$beta_tot_joint_T2_vs_C > 0) == expect_positive_T2, na.rm = TRUE)
     )
   }
 
@@ -626,21 +727,17 @@ simulate_cattle_power <- function(
 
   results <- bind_rows(results_list)
 
-  # Save outputs
-  csv_path <- file.path(tabs_dir, glue::glue("{outfile_stem}_{outcome_selected}.csv"))
-  readr::write_csv(results, csv_path)
-
-  # Long format for downstream (ensure swept_arm exists for consistent ordering)
+  # Prepare all output data frames
+  # 1. Wide format power results
+  results_wide <- results
+  
+  # 2. Long format for plotting (ensure swept_arm exists for consistent ordering)
   if (!("swept_arm" %in% names(results))) results <- results |> mutate(swept_arm = NA_character_)
   long_res <- results |>
     pivot_longer(cols = starts_with("power_"), names_to = "series", values_to = "power") |>
     arrange(sweep_value, swept_arm)
-  long_csv_path <- file.path(tabs_dir, glue::glue("{outfile_stem}_{outcome_selected}_long.csv"))
-  readr::write_csv(long_res, long_csv_path)
 
-  # Persist a small metadata table describing the run (CSV is canonical).
-  # Build a small metadata table and write it alongside the exported CSV as a companion
-  # key/value CSV; if available, also write an Excel workbook with two sheets (long + meta).
+  # 3. Metadata table describing the run
   meta <- list(
     outfile_stem = outfile_stem,
     outcome = outcome_selected,
@@ -654,21 +751,22 @@ simulate_cattle_power <- function(
     analysis_mode = analysis_mode,
     month_aggregate_mode = agg_mode_cont,
     cluster_se = cluster_se,
+    estimate_tot = estimate_tot,
     arms = paste(arms, collapse = ","),
     alloc_ratios = paste(names(alloc_ratios), "=", alloc_ratios, collapse = ", "),
     take_up = paste(names(take_up), "=", take_up, collapse = ", "),
-    sigma_assoc = sigma_assoc,
-    sigma_cow = sigma_cow,
-    rho_ar1 = rho_ar1,
-    sigma_ar = sigma_ar,
-    rho_month = rho_month,
-    sigma_month = sigma_month,
-    het_var_ngo = het_var$ngo,
-    het_var_tribe = het_var$tribe,
-    het_var_year = het_var$year,
+    icc_sigma_assoc = sigma_assoc,
+    icc_sigma_cow = sigma_cow,
+    ar1_cow_event_rho = rho_ar1,
+    ar1_cow_event_sigma = sigma_ar,
+    ar1_cow_month_rho = rho_month,
+    ar1_cow_month_sigma = sigma_month,
+    strat_sigma_ngo = strat_var$ngo,
+    strat_sigma_tribe = strat_var$tribe,
+    strat_sigma_yr = strat_var$year,
     missingness_p_cow_month = p_miss,
     effect_multipliers = paste(names(eff_mult), "=", eff_mult, collapse = ", "),
-    # Additional provenance and simulation parameters used during estimation
+    expected_direction = config$expected_direction %||% "auto",
     alpha = alpha,
     hc_type = hc_type,
     parallel_layer = parallel_layer,
@@ -679,50 +777,63 @@ simulate_cattle_power <- function(
     print_sim_numbers = print_sim_numbers,
     sim_progress = sim_progress,
     agg_mode_cont = agg_mode_cont,
-    # Summarize stratifier assignments (unique levels or samples)
     ngo_levels = paste(unique(ngo), collapse = ","),
     tribe_levels = paste(unique(tribe), collapse = ","),
     year_levels = paste(unique(year), collapse = ",")
   )
   meta_vec <- unlist(meta)
   meta_df <- tibble::tibble(parameter = names(meta_vec), value = as.character(meta_vec))
-  meta_path <- file.path(tabs_dir, glue::glue("{outfile_stem}_{outcome_selected}_meta.csv"))
-  # Robustly attempt to write meta CSV; fall back to write.table if readr fails
-  tryCatch(
-    {
-      readr::write_csv(meta_df, meta_path)
-      message("Wrote meta CSV: ", meta_path)
-    },
-    error = function(e) {
-      message("Warning: failed to write meta CSV with readr: ", conditionMessage(e), " — attempting fallback write.table")
-      tryCatch(
-        write.table(meta_df, file = meta_path, sep = ",", row.names = FALSE, col.names = TRUE),
-        error = function(e2) message("Fallback write.table also failed: ", conditionMessage(e2))
-      )
-    }
-  )
-  # Also write a copy of the meta CSV to the repository-relative output path (cwd-based)
-  repo_meta_path <- file.path(getwd(), "output", "cattle", "tabs", glue::glue("{outfile_stem}_{outcome_selected}_meta.csv"))
-  tryCatch({
-    readr::write_csv(meta_df, repo_meta_path)
-    message("Wrote repo-local meta CSV: ", repo_meta_path)
-  }, error = function(e) {
-    message("Warning: failed to write repo-local meta CSV: ", conditionMessage(e))
-  })
 
-  # If writexl is available, write a small workbook with two sheets (long + meta) for Excel users
+  # 4. Last simulation data (if available)
+  last_val <- sweep_values[length(sweep_values)]
+  last_arm <- if (sweep_param == "effect_mult" && isTRUE(sweep_each_arm)) tail(trt_arms, 1) else NULL
+  cfg_last <- config
+  if (sweep_param == "effect_mult") {
+    eff <- eff_mult
+    if (is.null(last_arm)) {
+      for (a in trt_arms) eff[[a]] <- last_val
+    } else {
+      eff[[last_arm]] <- last_val
+    }
+    cfg_last$effect_mult <- eff
+  } else if (sweep_param == "cows_tagged_per_association") {
+    cfg_last$cows_tagged_per_association <- as.integer(pmax(1, round(last_val)))
+  }
+  last_run <- one_run(cfg_last, capture_data = TRUE)
+  last_sim_df <- if (is.list(last_run) && !is.null(last_run$df)) last_run$df else NULL
+
+  # Write consolidated Excel file with power results and metadata
+  # Note: last_sim_data is saved as separate CSV because it often exceeds Excel's 1M row limit
   xlsx_path <- file.path(tabs_dir, glue::glue("{outfile_stem}_{outcome_selected}.xlsx"))
   if (requireNamespace("writexl", quietly = TRUE)) {
-    tryCatch(
-      writexl::write_xlsx(list(long = long_res, meta = meta_df), path = xlsx_path),
-      error = function(e) NULL
+    sheets <- list(
+      power_long = long_res,
+      power_wide = results_wide,
+      metadata = meta_df
     )
+    
+    tryCatch({
+      writexl::write_xlsx(sheets, path = xlsx_path)
+      message("Wrote consolidated Excel file: ", xlsx_path)
+    }, error = function(e) {
+      message("Warning: failed to write Excel file: ", conditionMessage(e))
+    })
+  } else {
+    message("Note: writexl package not available; skipping Excel output. Install with install.packages('writexl')")
+  }
+  
+  # Write last simulation data as separate CSV (often too large for Excel)
+  if (!is.null(last_sim_df)) {
+    last_data_csv <- file.path(tabs_dir, glue::glue("{outfile_stem}_{outcome_selected}_last_sim_data.csv"))
+    tryCatch({
+      readr::write_csv(last_sim_df, last_data_csv)
+      message("Wrote last simulation data: ", last_data_csv)
+    }, error = function(e) {
+      message("Warning: failed to write last simulation CSV: ", conditionMessage(e))
+    })
   }
 
-  # Read the tidy CSV back from disk and use that as the plotting data source so the CSV is canonical
-  long_res <- readr::read_csv(long_csv_path, show_col_types = FALSE)
-
-  # Plot (only ITT series in the figure)
+  # Plot (only ITT series in the figure) - use long_res already in memory
   plot_res <- long_res |>
     filter(grepl("^power_itt", series)) |>
     mutate(series = case_when(
@@ -734,33 +845,37 @@ simulate_cattle_power <- function(
 
   series_levels <- unique(plot_res$series)
   cols <- setNames(get_palette(length(series_levels), "Dark2"), series_levels)
+  
+  # Get baseline mu0 for the outcome
+  mu0_val <- config$mu_baseline[[outcome_selected]] %||% 0
+  
   # Build a left-justified, multi-line footnote with main simulation parameters (grouped, verbose labels)
   # Grouping helps readers quickly find design, stratifiers, variance, missingness and effect settings.
   foot_lines <- c(
+
     # Run-level
-    glue::glue("Run: sims={sims}    |    Outcome={outcome_selected}    |    Sweep={sweep_param}"),
+    glue::glue("Simulation: sims = {sims}, outcome = {outcome_selected}, variation in {sweep_param}"),
 
     # Design
-    glue::glue("Design: associations={n_assoc}, cows_per_association={cows_per_assoc}, cows_tagged={cows_tagged}, months_T={months_T}, events_per_month_E={events_E}"),
+    glue::glue("Design: associations = {n_assoc}, cows tagged per assoc. = {cows_tagged}, months = {months_T}, observed events per month = {events_E}, missing tags = {format(p_miss, digits=3)}"),
 
     # Stratifiers
-    glue::glue("Stratifiers: ngo_levels={length(unique(ngo))}, tribe_levels={length(unique(tribe))}, year_levels={length(unique(year))}"),
+    glue::glue("Stratifiers: {length(unique(ngo))} ngos, {length(unique(tribe))} tribes, {length(unique(year))} yrs in the program"),
 
-    # Variance components & temporal correlation
-    glue::glue("Variance: sigma_assoc={format(sigma_assoc, digits=3)}, sigma_cow={format(sigma_cow, digits=3)}, rho_ar1={format(rho_ar1, digits=3)}, sigma_ar={format(sigma_ar, digits=3)}"),
+    # ICC variance components (within associations)
+    glue::glue("ICC variance: icc_sigma_assoc = {format(sigma_assoc, digits=3)}, icc_sigma_cow = {format(sigma_cow, digits=3)}"),
+    
+    # AR(1) temporal components
+    glue::glue("AR(1) event-level: ar1_cow_event_rho = {format(rho_ar1, digits=3)}, ar1_cow_event_sigma = {format(sigma_ar, digits=3)}"),
+    glue::glue("AR(1) month-level: ar1_cow_month_rho = {format(rho_month, digits=3)}, ar1_cow_month_sigma = {format(sigma_month, digits=3)}"),
 
-    # Heterogeneity of treatment effects
-    glue::glue("Heterogeneity (TE var): ngo={format(het_var$ngo, digits=3)}, tribe={format(het_var$tribe, digits=3)}, year={format(het_var$year, digits=3)}"),
-
-    # Missingness and inference
-    glue::glue("Missingness: p_cow_month={format(p_miss, digits=3)}    |    Cluster SE={cluster_se}    |    HC type={hc_type}"),
+    # Stratifier baseline variance (across associations)
+    glue::glue("Stratifier baseline variance: strat_sigma_ngo = {format(strat_var$ngo, digits=3)}, strat_sigma_tribe = {format(strat_var$tribe, digits=3)}, strat_sigma_yr = {format(strat_var$year, digits=3)}"),
 
     # Treatment effects
-    glue::glue("Effect multipliers: {paste0(names(eff_mult), '=', eff_mult, collapse = ', ')}"),
-
-    # Parallelism / reproducibility
-    glue::glue("Parallel layer: {parallel_layer}    |    seed={seed}")
+    glue::glue("Baseline prob/mean: {format(if(is_binary) plogis(mu0_val) else exp(mu0_val), digits=3)}, ATE: {paste0(names(eff_mult), '=', eff_mult, collapse = ', ')}, Cluster SE = {cluster_se}, HC type={hc_type}")
   )
+
   footnote_text <- paste(foot_lines, collapse = "\n")
 
   plt <- ggplot(plot_res, aes(x = sweep_value, y = power, color = series)) +
@@ -786,27 +901,14 @@ simulate_cattle_power <- function(
   pdf_path <- file.path(figs_dir, glue::glue("{outfile_stem}_{outcome_selected}.pdf"))
   ggsave(png_path, plt, width = 8, height = 5, dpi = 150)
   ggsave(pdf_path, plt, width = 8, height = 5)
-  last_val <- sweep_values[length(sweep_values)]
-  last_arm <- if (sweep_param == "effect_mult" && isTRUE(sweep_each_arm)) tail(trt_arms, 1) else NULL
-  cfg_last <- config
-  if (sweep_param == "effect_mult") {
-    eff <- eff_mult
-    if (is.null(last_arm)) {
-      for (a in trt_arms) eff[[a]] <- last_val
-    } else {
-      eff[[last_arm]] <- last_val
-    }
-    cfg_last$effect_mult <- eff
-  } else if (sweep_param == "cows_tagged_per_association") {
-    cfg_last$cows_tagged_per_association <- as.integer(pmax(1, round(last_val)))
-  }
-  last_run <- one_run(cfg_last, capture_data = TRUE)
-  if (is.list(last_run) && !is.null(last_run$df)) {
+
+  # Build output message
+  output_msg <- paste0("Exported results to:\n", xlsx_path, "\n", png_path, "\n", pdf_path)
+  if (!is.null(last_sim_df)) {
     last_data_csv <- file.path(tabs_dir, glue::glue("{outfile_stem}_{outcome_selected}_last_sim_data.csv"))
-    readr::write_csv(last_run$df, last_data_csv)
+    output_msg <- paste0(output_msg, "\n", last_data_csv)
   }
+  message(output_msg)
 
-  message("Exported results to:\n", csv_path, "\n", long_csv_path, "\n", png_path, "\n", pdf_path)
-
-  list(results = results, csv = csv_path, long_csv = long_csv_path, png = png_path, pdf = pdf_path)
+  list(results = results, xlsx = xlsx_path, png = png_path, pdf = pdf_path)
 }

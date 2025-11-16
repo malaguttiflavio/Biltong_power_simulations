@@ -180,16 +180,20 @@ output:
       2.5.4.3.2. The month-level parameters default to `rho_month = 0` and `sigma_month = 0` (disabled unless set in `config`).
       2.5.4.3.3. Together the month-level term \(m_{ij,t}\) (applied to all events in month \(t\)) and the event-level term \(e_{ij,s}\) produce persistence both across months and between adjacent events: an event outcome influences the next event via the event-level AR(1), while month-level trends create slower-moving shifts across all events in a month.
 
-2.5.5. Heterogeneous treatment effects:
-   2.5.5.1. Treatment effects are allowed to vary systematically with association-level stratifiers:  
+2.5.5. Baseline heterogeneity from stratifiers:
+   2.5.5.1. Each association receives baseline level-shifts based on its stratification characteristics:  
        2.5.5.1.1. NGO ID.  
        2.5.5.1.2. Tribe ID.  
        2.5.5.1.3. Year in program.  
-   2.5.5.2. For each arm and stratifier, there is a random treatment-effect component with mean zero and variance (all on the link scale):  
-       2.5.5.2.1. `het_var_ngo`.  
-       2.5.5.2.2. `het_var_tribe`.  
-       2.5.5.2.3. `het_var_year`.  
-   2.5.5.3. Defaults: 0.5 for each of these variance terms, implying substantial between-context heterogeneity in treatment impacts.
+   2.5.5.2. For each association \(i\), independent random draws are made:  
+       2.5.5.2.1. `het_ngo_i ~ N(0, sqrt(het_var_ngo))`.  
+       2.5.5.2.2. `het_tribe_i ~ N(0, sqrt(het_var_tribe))`.  
+       2.5.5.2.3. `het_year_i ~ N(0, sqrt(het_var_year))`.  
+   2.5.5.3. These are summed to create a stratifier-based baseline shift: `strata_shift_i = het_ngo_i + het_tribe_i + het_year_i`.
+   2.5.5.4. This `strata_shift` affects baseline outcomes for **all units** (both control and treated) in that association, creating systematic differences across NGOs, tribes, and program cohorts.
+   2.5.5.5. These baseline shifts are **not** treatment effect heterogeneity; they represent pre-existing differences in outcomes due to context that affect control and treated units equally.
+   2.5.5.6. Defaults: `het_var_ngo = 0.5`, `het_var_tribe = 0.5`, `het_var_year = 0.5`, implying substantial variation in baseline outcomes across contexts.
+   2.5.5.7. In the estimation models, fixed effects for `ngo_f`, `tribe_f`, and `year_f` are included to absorb this heterogeneity and improve precision.
 
 ## 2.6 Treatment Effects on Outcomes
 
@@ -200,25 +204,399 @@ output:
        2.6.1.2.2. `effect_mult["T2"] = 1.20`.  
    2.6.1.3. On the log scale, this corresponds to adding \(\log(\text{effect\_mult[a]})\) to the linear predictor.
 
-2.6.2. For binary outcomes, treatment effects are implemented on the probability scale (percent change), not as odds ratios.
-   2.6.2.1. The engine first assembles a link-scale linear predictor \(\eta_{ijte} = \mu_{\text{baseline}} + u_i + v_{ij} + m_{ijt} + e_{ijte} + \dots\) as described in Section 2.5.
-   2.6.2.2. The baseline probability under control is computed as \(p^{(0)}_{ijte} = \operatorname{logit}^{-1}(\eta_{ijte})\).
-   2.6.2.3. The user-specified `effect_mult[a]` is interpreted as a multiplicative factor on this baseline probability for treated observations. For a treated unit the simulated probability becomes
-   \[ p^{(1)}_{ijte} = \operatorname{clamp}\big(p^{(0)}_{ijte} \times \text{effect\_mult}[a] + \tau_i,\; 0,\; 1\big), \]
-   where \(\tau_i\) denotes optional additive heterogeneity by association (the code records this in the run metadata) and clamp() enforces the \([0,1]\) bounds.
-   2.6.2.4. In practice, `effect_mult = 1.05` means "+5% of the baseline probability": for baseline 0.90 the treated probability would be ≈0.945 before clipping. This is intentionally different from odds-ratio scaling; the engine records the DGP choice (probability-scale multiplier) in the meta CSV so downstream consumers know how to interpret `effect_mult`.
+2.6.2. For binary outcomes, treatment effects are implemented as probability-scale multipliers applied **only to the base mean** (mu0), not as odds ratios.
+   2.6.2.1. **Step 1**: Compute the baseline probability from `mu0` alone:
+       2.6.2.1.1. For control units: \(p_{\mu_0} = \operatorname{logit}^{-1}(\mu_0)\).
+       2.6.2.1.2. For treated units: \(p_{\mu_0}^{\text{treated}} = p_{\mu_0} \times \text{effect\_mult}[a]\), clipped to \([0,1]\).
+   2.6.2.2. **Step 2**: Convert the treated mean back to the link scale:
+       2.6.2.2.1. \(\mu_0^{\text{treated}} = \operatorname{logit}(p_{\mu_0}^{\text{treated}})\).
+   2.6.2.3. **Step 3**: Add all random components on the link scale:
+       2.6.2.3.1. \(\eta_{ijte} = \mu_0^{\text{treated}} + u_i + v_{ij} + m_{ijt} + e_{ijte} + \text{strata\_shift}_i\).
+       2.6.2.3.2. Where:
+           - \(u_i\) = association random effect
+           - \(v_{ij}\) = cow random effect  
+           - \(m_{ijt}\) = month-level AR(1) component
+           - \(e_{ijte}\) = event-level AR(1) component
+           - \(\text{strata\_shift}_i\) = baseline shift from NGO/tribe/year
+   2.6.2.4. **Step 4**: Compute final event probability:
+       2.6.2.4.1. \(p_{ijte} = \operatorname{logit}^{-1}(\eta_{ijte})\).
+   2.6.2.5. **Key insight**: The treatment multiplier affects only the base mean probability (from `mu0`), not the full baseline that includes random effects and stratifier shifts. All random components are additive on the link scale after treatment has been applied to `mu0`.
+   2.6.2.6. **Example**: If `mu0 = 0` (logit scale), `effect_mult = 1.05`, and `strata_shift_i = 0.5`:
+       2.6.2.6.1. Control: \(p = \operatorname{logit}^{-1}(0 + u_i + v_{ij} + \text{AR} + 0.5)\).
+       2.6.2.6.2. Treated: \(p_{\mu_0} = 0.5\), \(p_{\mu_0}^{\text{treated}} = 0.525\), \(\mu_0^{\text{treated}} = \operatorname{logit}(0.525) \approx 0.100\), then \(p = \operatorname{logit}^{-1}(0.100 + u_i + v_{ij} + \text{AR} + 0.5)\).
+   2.6.2.7. This is intentionally different from odds-ratio scaling or applying the multiplier to the full baseline probability. The engine records this DGP choice in the metadata so downstream consumers know how to interpret `effect_mult`.
 
 2.6.3. The full linear predictor for a given outcome is assembled from:
-   2.6.3.1. \(\mu_{\text{baseline}}\) — the baseline intercept on the link scale (log or logit depending on outcome).
+   2.6.3.1. \(\mu_{\text{baseline}}\) (or \(\mu_0^{\text{treated}}\) for treated units in binary outcomes) — the baseline intercept on the link scale (log or logit depending on outcome).
    2.6.3.2. Association-level random intercept \(u_i\sim N(0,\sigma^2_{\text{assoc}})\) and cow-level random intercept \(v_{ij}\sim N(0,\sigma^2_{\text{cow}})\).
-   2.6.3.3. Two additive temporal AR(1) components per cow: a month-level AR(1) \(m_{ijt}\) (slower-moving across months) and an event-level AR(1) \(e_{ijte}\) (finer-grained across events within month). The engine sums these components on the link scale before converting to a baseline probability for binary outcomes.
-   2.6.3.4. For binary outcomes the baseline probability is computed as \(p^{(0)}_{ijte} = \operatorname{logit}^{-1}(\mu_{\text{baseline}} + u_i + v_{ij} + m_{ijt} + e_{ijte})\). Treatment is then applied multiplicatively on this probability as described above.
+   2.6.3.3. Two additive temporal AR(1) components per cow: a month-level AR(1) \(m_{ijt}\) (slower-moving across months) and an event-level AR(1) \(e_{ijte}\) (finer-grained across events within month). The engine sums these components on the link scale.
+   2.6.3.4. Stratifier-based baseline shift \(\text{strata\_shift}_i\), which affects all units (control and treated) in association \(i\).
+   2.6.3.5. For binary outcomes: treatment multiplier is applied to \(\mu_0\) only (Step 1-2 above), then random components are added on the link scale (Step 3), and finally converted to probability (Step 4).
+   2.6.3.6. For continuous outcomes: treatment multiplier is applied on the log scale, and all components sum additively on that scale.
 
 2.6.4. The event-level outcome is then drawn from the appropriate distribution:
    2.6.4.1. For binary outcomes: draw \(Y_{ijte} \sim \mathrm{Bernoulli}(p_{ijte})\) where \(p_{ijte}\) follows the baseline → treatment procedure above (probability-scale multiplier + optional additive heterogeneity and clipping).
    2.6.4.2. For continuous outcomes: the engine uses a log-link multiplicative DGP (log-normal-like) where the linear predictor is exponentiated to produce the event-level mean; additional iid noise can be added if configured.
 
-## 2.7 Missingness
+## 2.7 From Linear Predictor to Observed Outcome: The DGP Flow
+
+This section clarifies how the building blocks described above combine to produce the observed outcome \(Y_{ijte}\), distinguishing between the **linear predictor** (systematic component on the link scale) and the **realized outcome** (on the probability or count scale).
+
+### 2.7.1 Overview: Building Blocks, Link Scale, and Outcome Scale
+
+1. All variance components (association random effects, cow random effects, AR components, stratifier shifts) are **generated and combined on the link scale**:
+   1.1. For binary outcomes: logit scale.
+   1.2. For continuous outcomes: log scale.
+
+2. The **linear predictor** (`comp_linpred` in the output dataset) is the sum of all these components on the link scale. It represents the **systematic component** of the model before applying the inverse link function or drawing random realizations.
+
+3. The **observed outcome** \(Y_{ijte}\) (variable `y` in the output dataset) is generated by:
+   3.1. Transforming `comp_linpred` from the link scale to the outcome scale using the **inverse link function**.
+   3.2. For binary outcomes: adding **random variation** via a Bernoulli draw.
+   3.3. For continuous outcomes: using the transformed value directly (deterministic given the linear predictor in the current DGP).
+
+### 2.7.2 Binary Outcomes: Detailed Flow
+
+For binary outcomes (e.g., `left_morning`, `left_night`), the process is:
+
+**Step 1: Start with baseline mu0 on logit scale**
+
+   1.1. The baseline log-odds is specified as `mu0` (e.g., `mu0 = logit(0.05)` for a 5% baseline probability).
+   1.2. This gives `comp_mu0 = mu0` for all observations.
+
+**Step 2: Apply treatment multiplier on probability scale (to mu0 only)**
+
+   2.1. Convert `mu0` to probability scale: \(p_{\mu_0} = \operatorname{logit}^{-1}(\text{comp\_mu0})\).
+   2.2. Multiply by treatment effect (for treated units): \(p_{\mu_0}^{\text{treated}} = p_{\mu_0} \times \text{effect\_mult}[a]\), where `effect_mult[a]` is the treatment multiplier for arm \(a\).
+   2.3. Clip to \([0,1]\): \(p_{\mu_0}^{\text{treated}} = \min(\max(p_{\mu_0}^{\text{treated}}, 0), 1)\).
+   2.4. **Key point**: The treatment multiplier is applied **only to the baseline probability from mu0**, not to the full baseline that includes random effects or stratifier shifts.
+
+**Step 3: Convert treated mu0 back to logit scale**
+
+   3.1. \(\mu_0^{\text{treated}} = \operatorname{logit}(p_{\mu_0}^{\text{treated}})\).
+   3.2. This is saved as `comp_mu0_treated` in the output dataset.
+
+**Step 4: Add all random components on logit scale**
+
+   4.1. Build the full linear predictor:
+        \[
+        \text{comp\_linpred} = \mu_0^{\text{treated}} + \text{comp\_assoc} + \text{comp\_cow} + \text{comp\_ar} + \text{comp\_strata},
+        \]
+        where:
+        - `comp_assoc` = association random effect \(u_i \sim N(0, \sigma^2_{\text{assoc}})\).
+        - `comp_cow` = cow random effect \(v_{ij} \sim N(0, \sigma^2_{\text{cow}})\).
+        - `comp_ar` = sum of event-level and month-level AR(1) components.
+        - `comp_strata` = baseline shift from NGO/tribe/year characteristics (sum of independent normals with variances `het_var_ngo`, `het_var_tribe`, `het_var_year`).
+   4.2. All these components are additive on the **logit scale**.
+
+**Step 5: Transform comp_linpred to probability scale**
+
+   5.1. Apply the inverse logit function:
+        \[
+        \text{comp\_prob} = \operatorname{logit}^{-1}(\text{comp\_linpred}) = \frac{1}{1 + e^{-\text{comp\_linpred}}}.
+        \]
+   5.2. This gives the **event probability** (a value between 0 and 1).
+
+**Step 6: Draw observed binary outcome**
+
+   6.1. Generate the realized outcome via a Bernoulli draw:
+        \[
+        Y_{ijte} = \text{Bernoulli}(\text{comp\_prob}).
+        \]
+   6.2. In R: `y <- rbinom(n, 1, comp_prob)`.
+   6.3. `rbinom(n, 1, prob)` draws \(n\) independent Bernoulli(prob) random variables:
+        - For each observation, R generates a uniform(0,1) random number.
+        - If the random number < `comp_prob`, then `y = 1`.
+        - If the random number ≥ `comp_prob`, then `y = 0`.
+   6.4. **There is no fixed threshold on the link scale**; the probability of \(y=1\) varies across observations according to their `comp_prob`.
+
+**Summary for binary outcomes:**
+
+\[
+\boxed{
+\begin{aligned}
+\text{comp\_mu0} &\xrightarrow{\text{inv\_logit}} p_{\mu_0} \xrightarrow{\times \text{effect\_mult}} p_{\mu_0}^{\text{treated}} \xrightarrow{\text{logit}} \mu_0^{\text{treated}} \\
+\text{comp\_linpred} &= \mu_0^{\text{treated}} + \text{comp\_assoc} + \text{comp\_cow} + \text{comp\_ar} + \text{comp\_strata} \quad \text{(logit scale)} \\
+\text{comp\_prob} &= \operatorname{logit}^{-1}(\text{comp\_linpred}) \quad \text{(probability scale)} \\
+y &\sim \text{Bernoulli}(\text{comp\_prob}) \quad \text{(observed 0/1 outcome)}
+\end{aligned}
+}
+\]
+
+### 2.7.3 Continuous Outcomes: Detailed Flow
+
+For continuous outcomes (e.g., `cows_tagged`), the process is simpler because treatment is applied on the link (log) scale and there is no additional random draw:
+
+**Step 1: Build all components on log scale**
+
+   1.1. `comp_mu0 = mu0` (baseline log-mean).
+   1.2. `comp_assoc = u_i` (association random effect).
+   1.3. `comp_cow = v_{ij}` (cow random effect).
+   1.4. `comp_ar = e_{ijte} + m_{ijt}` (AR components).
+   1.5. `comp_strata` (baseline shift from stratifiers).
+   1.6. `comp_trt = log(effect_mult[a]) × D_i` (treatment effect, where \(D_i\) is treatment receipt indicator).
+
+**Step 2: Sum to create comp_linpred (log scale)**
+
+   2.1. \[
+        \text{comp\_linpred} = \text{comp\_mu0} + \text{comp\_assoc} + \text{comp\_cow} + \text{comp\_ar} + \text{comp\_strata} + \text{comp\_trt}.
+        \]
+   2.2. All components are additive on the **log scale**.
+
+**Step 3: Transform comp_linpred to count scale**
+
+   3.1. Apply the exponential (inverse log) function:
+        \[
+        \text{comp\_expected\_mean} = \exp(\text{comp\_linpred}).
+        \]
+   3.2. This is the expected count on the original scale.
+
+**Step 4: Set observed outcome (deterministic)**
+
+   4.1. In the current DGP: \(Y_{ijte} = \text{comp\_expected\_mean}\).
+   4.2. There is no additional iid noise beyond the AR(1) components already included.
+   4.3. Extensions could add Poisson or negative binomial variation if desired.
+
+**Summary for continuous outcomes:**
+
+\[
+\boxed{
+\begin{aligned}
+\text{comp\_linpred} &= \text{comp\_mu0} + \text{comp\_assoc} + \text{comp\_cow} + \text{comp\_ar} + \text{comp\_strata} + \text{comp\_trt} \quad \text{(log scale)} \\
+\text{comp\_expected\_mean} &= \exp(\text{comp\_linpred}) \quad \text{(count scale)} \\
+y &= \text{comp\_expected\_mean} \quad \text{(observed outcome, deterministic)}
+\end{aligned}
+}
+\]
+
+### 2.7.4 Key Distinctions and Interpretations
+
+1. **`comp_linpred` is a diagnostic variable**, not used in regressions:
+   1.1. It shows the systematic component of the model on the link scale (logit or log).
+   1.2. It is saved in the output dataset to allow users to understand the data-generating process and diagnose issues.
+   1.3. It is **not** an input to the regression models.
+
+2. **`y` is the observed outcome** used in all regressions:
+   2.1. For binary outcomes: \(y \in \{0,1\}\) is the realized binary outcome.
+   2.2. For continuous outcomes: \(y \in [0, \infty)\) is the realized count.
+   2.3. Regressions (ITT, TOT) use `y` directly (binary) or `log(y)` (continuous) as the dependent variable.
+
+3. **Relationship between comp_linpred and y**:
+   3.1. Binary: \(y \sim \text{Bernoulli}(\operatorname{logit}^{-1}(\text{comp\_linpred}))\).
+   3.2. Continuous: \(y = \exp(\text{comp\_linpred})\).
+   3.3. The inverse link function transforms the linear predictor to the outcome scale, and (for binary) random variation is added via the Bernoulli distribution.
+
+4. **All building blocks are combined on the link scale first**:
+   4.1. Treatment effects, random effects, AR components, and stratifier shifts are all **additive on the link scale** (logit or log).
+   4.2. Only after the complete linear predictor is formed is it transformed to the outcome scale.
+   4.3. This is the standard GLM (Generalized Linear Model) approach: link scale for additivity, then inverse link for interpretation.
+
+5. **Controls in regressions**:
+   5.1. Regressions include fixed effects for `month`, `ngo`, `tribe`, and `year_in_program`.
+   5.2. These controls **absorb baseline heterogeneity** created by `comp_strata` in the DGP.
+   5.3. Stratifier variance components (`het_var_ngo`, `het_var_tribe`, `het_var_year`) create systematic differences in baseline levels across NGOs, tribes, and program cohorts; the fixed effects in regressions control for this variation and improve precision.
+
+### 2.7.5 Why Normal Variance Components on the Link Scale?
+
+A natural question: why do we draw variance components from Normal(0, σ) distributions on the **link scale** (logit or log) rather than the **probability/outcome scale**?
+
+1. **The link scale is where linearity and additivity hold**:
+
+   1.1. On the logit scale (binary outcomes) or log scale (continuous outcomes), the model is **linear and additive**:
+        \[
+        \text{comp\_linpred} = \mu_0 + u_{\text{assoc}} + u_{\text{cow}} + \text{AR} + \text{strata}.
+        \]
+   1.2. This is the natural scale for:
+        - Adding independent effects.
+        - Modeling variance components.
+        - Ensuring mathematical tractability and interpretability.
+
+2. **Normal distributions are closed under summation**:
+
+   2.1. If:
+        - \(u_{\text{assoc}} \sim N(0, \sigma^2_{\text{assoc}})\),
+        - \(u_{\text{cow}} \sim N(0, \sigma^2_{\text{cow}})\),
+        - \(\text{AR} \sim N(0, \sigma^2_{\text{ar}})\),
+   2.2. Then their sum is also normally distributed:
+        \[
+        u_{\text{assoc}} + u_{\text{cow}} + \text{AR} \sim N\left(0, \sigma^2_{\text{assoc}} + \sigma^2_{\text{cow}} + \sigma^2_{\text{ar}}\right).
+        \]
+   2.3. This makes **variance decomposition** clean and interpretable on the link scale: each σ² parameter corresponds to a distinct source of variation, and they sum to give the total variance.
+
+3. **On the probability/outcome scale, additivity breaks down**:
+
+   3.1. If you tried to add variance components directly on the **probability scale** (for binary outcomes), you would encounter problems:
+        - Probabilities must stay in \([0, 1]\), so you cannot simply add independent normal components without risking values outside this range.
+        - The effect of a random component would depend on the baseline probability, creating non-linear interactions.
+        - Variance components would no longer be independent or additive.
+   3.2. Similarly, for continuous outcomes on the count/outcome scale, additive normal components could produce negative values or other implausible outcomes.
+
+4. **After transformation, the outcome distribution is non-normal (and that's fine!)**:
+
+   4.1. When you transform `comp_linpred` from the link scale to the outcome scale:
+        - Binary: \(\text{comp\_prob} = \operatorname{logit}^{-1}(\text{comp\_linpred})\).
+        - Continuous: \(\text{comp\_expected\_mean} = \exp(\text{comp\_linpred})\).
+   4.2. The distribution of `comp_prob` or `comp_expected_mean` is **no longer normal**—it becomes a complex, bounded (for binary) or skewed (for continuous) distribution.
+   4.3. **This is intentional**: we model additively and normally on a transformed scale where linearity holds, then interpret results on the original scale where they are meaningful.
+
+5. **Analogy: Log-normal distributions**:
+
+   5.1. For continuous outcomes with a log link:
+        - On **log scale**: \(\text{comp\_linpred} \sim \text{Normal}\) (additive components).
+        - On **count scale**: \(y = \exp(\text{comp\_linpred})\) follows a **log-normal** distribution (non-normal, right-skewed, positive).
+   5.2. This is a standard modeling choice: we achieve simplicity and additivity on the log scale, then exponentiate to get realistic positive outcomes.
+
+6. **This is the standard approach in GLMs and GLMMs**:
+
+   6.1. Generalized Linear Mixed Models (GLMMs) always specify random effects as Normal on the **link scale**:
+        - The linear predictor is formed by summing them on the link scale.
+        - The inverse link function transforms to the outcome scale.
+        - The outcome itself (\(y\)) has a non-normal distribution appropriate to its type (Bernoulli for binary, Poisson or negative binomial for counts, etc.).
+   6.2. This framework ensures:
+        - Additivity and tractability on the link scale.
+        - Interpretable variance decomposition (each σ² corresponds to a distinct source of variation).
+        - Realistic, bounded/appropriate distributions on the outcome scale.
+
+**Summary**: Drawing variance components from Normal(0, σ) distributions on the link scale is the mathematically natural and statistically standard way to model heterogeneity in generalized linear models. It ensures additivity, tractability, and interpretable variance partitioning on the scale where the model is linear, while producing realistic and appropriately distributed outcomes after transformation.
+
+### 2.7.6 Variance Components and ICC: From Parameters to Correlation
+
+A related question: why do we specify **variance components** (σ²_assoc, σ²_cow, etc.) rather than directly specifying the **intra-cluster correlation (ICC)**?
+
+1. **ICC is an emergent property, not a direct input**:
+
+   1.1. The ICC is a **summary statistic** that quantifies the proportion of total variance attributable to cluster-level (association-level) variation.
+   1.2. For a simple two-level nested model (associations and observations within associations), the ICC is defined as:
+        \[
+        \text{ICC} = \frac{\sigma^2_{\text{assoc}}}{\sigma^2_{\text{assoc}} + \sigma^2_{\text{residual}}},
+        \]
+        where \(\sigma^2_{\text{residual}}\) includes all non-association sources of variation (cow effects, AR components, idiosyncratic noise).
+   1.3. In our DGP with multiple nested levels (association, cow, AR month, AR event) and stratifier shifts, the total variance on the link scale is:
+        \[
+        \sigma^2_{\text{total}} = \sigma^2_{\text{assoc}} + \sigma^2_{\text{cow}} + \sigma^2_{\text{ar\_month}} + \sigma^2_{\text{ar\_event}} + \sigma^2_{\text{strata}},
+        \]
+        and the association-level ICC is:
+        \[
+        \text{ICC}_{\text{assoc}} = \frac{\sigma^2_{\text{assoc}}}{\sigma^2_{\text{total}}}.
+        \]
+
+2. **Why specify variance components rather than ICC directly?**
+
+   2.1. **Mechanistic data generation**: To simulate correlated data, we need to actually **draw random effects** \(u_{\text{assoc}} \sim N(0, \sigma^2_{\text{assoc}})\) and add them to observations. The ICC is a consequence of these draws, not something we can "apply" directly to create correlation.
+   2.2. **Decomposing sources of variation**: By specifying each variance component separately, we can:
+        - Control how much variation comes from associations vs. cows vs. temporal autocorrelation.
+        - Understand which sources of variation most impact power.
+        - Match empirical variance decompositions from pilot data or prior studies.
+   2.3. **Flexibility**: The variance components allow us to model complex, realistic correlation structures (nested clustering + temporal autocorrelation) that go beyond what a single ICC parameter could capture.
+
+3. **The relationship in practice**:
+
+   3.1. If you have a **target ICC** (e.g., from pilot data or literature), you can choose variance components to achieve it.
+   3.2. For example, to achieve ICC_assoc = 0.20 with total variance ≈ 1.0 on the link scale, you might set:
+        - \(\sigma^2_{\text{assoc}} = 0.20\)
+        - \(\sigma^2_{\text{cow}} = 0.30\)
+        - \(\sigma^2_{\text{ar\_month}} = 0.20\)
+        - \(\sigma^2_{\text{ar\_event}} = 0.30\)
+        - Total ≈ 1.0, so ICC_assoc ≈ 0.20/1.0 = 0.20.
+   3.3. Conversely, you can estimate the **implied ICC** from your chosen variance components using the formula above.
+
+4. **Hierarchical clustering structure**:
+
+   4.1. In this DGP, observations are nested:
+        - Events within cows within associations.
+   4.2. This creates **multiple levels of correlation**:
+        - Observations from the same cow are correlated (due to \(u_{\text{cow}}\) and AR components).
+        - Observations from different cows in the same association are correlated (due to \(u_{\text{assoc}}\) and \(\text{comp\_strata}\)).
+   4.3. The variance components generate this nested correlation structure:
+        - All cows in association \(i\) share the same \(u_{\text{assoc}, i}\), creating correlation among cows.
+        - All observations for cow \(j\) share the same \(u_{\text{cow}, j}\), creating correlation over time for that cow.
+        - AR(1) components create additional temporal correlation within cow trajectories.
+
+5. **Why this approach aligns with GLMMs**:
+
+   5.1. Standard software for fitting Generalized Linear Mixed Models (e.g., `lme4::glmer` in R) estimates **variance components**, not ICCs directly.
+   5.2. Users specify random effects (association, cow), and the software estimates their variances (\(\sigma^2_{\text{assoc}}\), \(\sigma^2_{\text{cow}}\)).
+   5.3. ICC can be calculated post-hoc from these estimates.
+   5.4. Our simulation mirrors this: we specify the variance components as inputs, and the ICC emerges as a property of the simulated data.
+
+**Summary**: We specify variance components (σ²) rather than ICC directly because (1) we need actual random effects to mechanistically generate correlation in the data, (2) variance components allow flexible decomposition of multiple sources of variation, and (3) this aligns with standard GLMM methodology. The ICC is an emergent property computed from the variance components, not a direct input. To achieve a target ICC, choose variance components that sum appropriately.
+
+### 2.7.7 Total Variance and the Temptation to Simplify
+
+A natural question arises: since all variance components are additive on the link scale, why not simplify the DGP to a single composite shock?
+
+1. **Total variance on the link scale**:
+
+   1.1. The total variance of the random part of the linear predictor is the sum of all component variances:
+        \[
+        \sigma^2_{\text{total}} = \sigma^2_{\text{strat,ngo}} + \sigma^2_{\text{strat,tribe}} + \sigma^2_{\text{strat,year}} + \sigma^2_{\text{assoc}} + \sigma^2_{\text{cow}} + \sigma^2_{\text{ar,event}} + \sigma^2_{\text{ar,month}}.
+        \]
+   1.2. For the AR(1) components, the steady-state variance is approximately \(\sigma^2_{\text{innovation}} / (1 - \rho^2)\), where \(\rho\) is the autocorrelation coefficient.
+   1.3. **Example** with default parameter values:
+        - Stratifier variances: \(0.5^2 + 0.5^2 + 0.5^2 = 0.75\)
+        - ICC variances: \(0.5^2 + 0.5^2 = 0.50\)
+        - AR event: \(0.5^2 / (1 - 0.5^2) \approx 0.33\)
+        - AR month: \(0.25^2 / (1 - 0.25^2) \approx 0.07\)
+        - **Total**: \(\sigma^2_{\text{total}} \approx 1.65\), so \(\sigma_{\text{total}} \approx 1.28\).
+
+2. **What this means in probability space (for binary outcomes)**:
+
+   2.1. With \(\sigma_{\text{total}} \approx 1.28\) on the logit scale and a baseline of 95% (`left_morning`):
+        - Baseline: \(\mu_0 = \operatorname{logit}(0.95) \approx 2.944\).
+        - 95% interval: \(\mu_0 \pm 2 \times 1.28 = [0.38, 5.50]\).
+        - On probability scale: \([59.5\%, 99.6\%]\).
+   2.2. This represents **substantial heterogeneity**: two cows in different contexts (associations, NGOs, tribes) can have probabilities differing by ~40 percentage points.
+   2.3. The variance on the link scale translates to wide variation in outcome probabilities, reflecting realistic diversity across units.
+
+3. **Why not simplify to a single composite shock?**
+
+   3.1. **Marginal distribution**: If you only care about the marginal distribution of outcomes, you could replace all variance components with a single draw:
+        \[
+        \text{comp\_linpred} = \mu_0^{\text{treated}} + \epsilon, \quad \epsilon \sim N(0, \sigma^2_{\text{total}}).
+        \]
+        This produces the **same marginal variance** but loses all structure.
+   
+   3.2. **Correlation structure is lost**: The decomposition creates **shared components** that induce correlation:
+        - All cows in association \(i\) share the same \(u_{\text{assoc}, i}\), creating **intra-cluster correlation** (ICC).
+        - All observations for cow \(j\) share the same \(u_{\text{cow}, j}\), creating **within-cow correlation** over time.
+        - AR(1) components create **temporal autocorrelation** within cow trajectories.
+        - Stratifier shifts create **baseline heterogeneity** across NGOs, tribes, and cohorts that regression controls can absorb.
+   
+   3.3. **Power depends on correlation structure, not just total variance**:
+        - With a single composite shock, all observations are **independent**: no clustering, no temporal correlation.
+        - In clustered designs, **effective sample size** is reduced by ICC: \(n_{\text{eff}} \approx n / (1 + (m-1) \times \text{ICC})\), where \(m\) is cluster size.
+        - Temporal correlation affects how much **information** multiple observations per cow provide.
+        - Stratifier controls (NGO, tribe, year fixed effects) only improve precision if those components **actually create variation** to be absorbed.
+   
+   3.4. **Realistic simulation requires structure**:
+        - To mirror real data, where cows cluster within associations, outcomes correlate over time, and contexts (NGOs, tribes) differ systematically, we must decompose variance into its constituent sources.
+        - A single composite shock would give the right **marginal variance** but wrong **covariance structure**, yielding unrealistic power estimates.
+
+4. **The AR(1) components are special**:
+
+   4.1. Unlike the other components (which are constant over time for a given unit), AR(1) components create **dynamic temporal correlation**:
+        \[
+        y_t = \rho \, y_{t-1} + \text{innovation}_t, \quad \text{innovation}_t \sim N(0, \sigma^2).
+        \]
+   4.2. This cannot be replaced by an iid shock without losing the time-series structure.
+   4.3. The autocorrelation \(\rho\) determines how quickly shocks decay over time, affecting the **effective number of independent observations** within a cow's trajectory.
+
+5. **When would simplification make sense?**
+
+   5.1. If you were doing a **simple, non-clustered power calculation** where:
+        - Units are independent (no ICC).
+        - No temporal correlation.
+        - No stratification or baseline heterogeneity to control for.
+   5.2. Then you could use:
+        \[
+        y_i = \mu_0 + \beta \, D_i + \epsilon_i, \quad \epsilon_i \sim N(0, \sigma^2_{\text{total}}),
+        \]
+        and compute power based on \(\sigma^2_{\text{total}}\) alone.
+   5.3. But for clustered, longitudinal designs like this cattle tracking study, the **decomposition is essential** for realistic power.
+
+**Summary**: While variances are additive on the link scale (\(\sigma^2_{\text{total}} = \sum \sigma^2_j\)), you cannot simplify to a single composite shock without losing the correlation structure (ICC, temporal autocorrelation, stratifier heterogeneity) that critically affects power. The decomposition into variance components is necessary to generate realistic clustered, longitudinal data and obtain accurate power estimates. Total variance determines the **marginal spread** of outcomes, but power depends on **how** that variance is structured across units, clusters, and time.
+
+## 2.8 Missingness
 
 1. The DGP allows for independent missingness at the cow-month level:
    1.1. Each cow-month observation is dropped with probability `missingness_p_cow_month`.  
@@ -322,7 +700,65 @@ output:
 
    4.1. For each estimator and arm the engine constructs Wald-type tests using the chosen robust/clustered vcov matrix and computes p-values.
 
-   4.2. Empirical power is estimated by the Monte Carlo proportion of simulations in which the two-sided test rejects at level `alpha`.
+   4.2. **Signed power (directional power)**: Empirical power is estimated by the Monte Carlo proportion of simulations in which the two-sided test rejects at level `alpha` **AND** the estimated coefficient has the correct sign (positive or negative) based on the DGP.
+        4.2.1. The expected direction is controlled by the `expected_direction` parameter in config:
+               4.2.1.1. `"positive"`: treatment increases outcome; `effect_mult > 1.0` should produce positive coefficients.
+               4.2.1.2. `"negative"`: treatment decreases outcome; `effect_mult > 1.0` should produce negative coefficients (e.g., for outcomes like disease incidence where treatment aims to reduce).
+               4.2.1.3. `"auto"` (default): infer from `effect_mult` values (`> 1.0` = positive, `< 1.0` = negative).
+        4.2.2. For T1 vs Control and T2 vs Control: the expected sign is determined by the `expected_direction` setting combined with the `effect_mult[a]` value.
+        4.2.3. For T1 vs T2: the expected sign depends on the relative magnitudes `effect_mult["T1"]` vs `effect_mult["T2"]` (positive if T1 > T2).
+        4.2.4. This ensures that spurious rejections with the wrong sign (e.g., negative coefficients when positive effects are simulated) do not inflate power estimates.
+        4.2.5. This is critical when heterogeneity or other variance components can occasionally produce estimates with sign flips; counting only correctly-signed rejections gives a more conservative and meaningful power estimate.
+        4.2.6. **Example usage**: For an outcome like `left_morning` (presence) where treatment should increase the outcome, use `expected_direction = "positive"`. For an outcome like disease incidence where treatment should reduce it, use `expected_direction = "negative"`.
+
+   ### 3.3.4 Regression equations and inference
+
+   1. ITT — linear regression (lm)
+
+      1.1. The primary ITT estimand is estimated by OLS at the analysis level (month or event). For a two-treatment design (T1, T2) with control as reference the working regression is:
+
+      \[
+      Y_{ijt} = \alpha + \beta_{1}\,\mathbf{1}\{Z_i=\text{T1}\} + \beta_{2}\,\mathbf{1}\{Z_i=\text{T2}\} + \sum_{t}\gamma_t\,\mathbf{1}\{\text{month}=t\} + \sum_{s}\delta_s\,\mathbf{1}\{\text{stratum}=s\} + \varepsilon_{ijt},
+      \]
+
+      where the outcome \(Y_{ijt}\) is the aggregated analysis-level outcome (for example the monthly count or proportion for cow \(j\) in association \(i\) at month \(t\)), the \(\gamma_t\) are month fixed effects, the \(\delta_s\) are stratifier fixed effects (NGO, tribe, year-in-program), and the coefficients \(\beta_1,\beta_2\) are ITT differences relative to control. For binary outcomes the engine uses a linear probability model (LPM) so the \(\beta\)s are interpreted in percentage-point differences.
+      
+      1.2. Including stratifier controls improves precision by absorbing baseline heterogeneity across strata that is built into the DGP via `het_var_ngo`, `het_var_tribe`, and `het_var_year`. These represent systematic differences in baseline outcomes (not treatment effects) across NGOs, tribes, and program cohorts.
+
+   2. TOT — linear IV (2SLS)
+
+      2.1. When estimating Treatment-on-the-Treated the engine fits a linear IV model using assignment indicators as instruments for realized treatment receipt. In reduced form / first-stage form we have, for each treatment arm indicator:
+
+      First stage(s):
+      \[
+      D_{ijt} = \pi_0 + \pi_1\,\mathbf{1}\{Z_i=\text{T1}\} + \pi_2\,\mathbf{1}\{Z_i=\text{T2}\} + \sum_{t}\phi_t\,\mathbf{1}\{\text{month}=t\} + \sum_{s}\theta_s\,\mathbf{1}\{\text{stratum}=s\} + u_{ijt},
+      \]
+
+      Second stage (structural):
+      \[
+      Y_{ijt} = \alpha + \delta\,\widehat{D}_{ijt} + \sum_{t}\gamma_t\,\mathbf{1}\{\text{month}=t\} + \sum_{s}\delta_s\,\mathbf{1}\{\text{stratum}=s\} + v_{ijt},
+      \]
+
+      where \(D_{ijt}\) is actual receipt (often constant at the association level), \(\widehat{D}_{ijt}\) is the fitted value from the first stage, and \(\delta\) is the TOT effect on the same scale as the ITT (probability/difference scale for binary outcomes when the LPM is used). Stratifier controls are included in both stages.
+
+   3. Standard errors and clustering
+
+      3.1. For both OLS and IV the engine computes cluster-robust covariance matrices at the association (cluster) level using `sandwich::vcovCL`. The resulting covariance is used to form Wald statistics and confidence intervals. If computing the cluster-robust vcov fails due to numerical or small-sample issues the code falls back to heteroskedasticity-robust (HC) vcov estimators to avoid aborting simulations.
+
+   4. Wald contrasts and testing differences between arms (T1 vs T2)
+
+      4.1. To test hypotheses such as \(H_0: \beta_1 - \beta_2 = 0\) the engine constructs a contrast vector \(R = [0, 1, -1, 0, \dots]\) (matching the ordering of coefficients returned by the model) and computes the Wald statistic:
+
+      \[
+      W = (R\widehat{\beta})^{\top} \left(R \widehat{V}(\widehat{\beta}) R^{\top}\right)^{-1} (R\widehat{\beta}),
+      \]
+
+      which under regularity approximates a \(\chi^2_1\) distribution; p-values are obtained from that reference distribution. Here \(\widehat{V}(\widehat{\beta})\) is the robust (clustered) covariance matrix used by the engine.
+
+   5. Practical notes
+
+      5.1. Because the engine intentionally uses linear estimators (LPM for binary outcomes and linear 2SLS for TOT) the estimated effects and IV/TOT estimates remain on the same additive scale as the ITT and are straightforward to interpret as differences in probability or unit-scale differences for continuous outcomes.
+
 
 ## 3.4 Sweep over `cows_tagged_per_association`
 
@@ -358,6 +794,60 @@ output:
       3.1.3. `meta_csv`: companion key/value metadata CSV describing all run settings and DGP choices (e.g. whether binary effects were applied on the probability scale). An Excel workbook (`.xlsx`) with sheets for `long` and `meta` is written when `writexl` is available.
       3.1.4. `png`, `pdf`: paths to power curve figures (generated from the `long_csv`).
    3.2. The master script prints these paths to the console and then resets the parallel plan to `sequential`. If you want to regenerate figures later, use the provided `regenerate_figs_from_csv.R` script which reads the `*_long.csv` and writes updated PNG/PDF files into `output/cattle/figs/`.
+
+   ### 3.5 Implementation notes: parallelization, outputs, progress, and binary-DGP semantics
+
+   1. Parallelization and reproducibility
+
+      1.1. The engine exposes a `parallel_layer` option that controls where parallel work happens:
+         1.1.1. `"outer"` (default in the master) parallelizes across sweep values and/or Monte Carlo repetitions by scheduling independent jobs via `future`/`furrr` (e.g. `plan(multisession, workers = N)`).
+         1.1.2. `"inner"` attempts to parallelize work inside a single sweep value (e.g. replicate-level mapping). This can be faster when the sweep dimension is small but requires care with progress printing and RNG seeding.
+         1.1.3. `"none"` runs everything sequentially (useful for debugging or on single-core environments).
+
+      1.2. The master script in this repo sets a multi-session plan (e.g. `plan(multisession, workers = 12)`) and calls `simulate_cattle_power(..., parallel_layer = "outer")` by default. After the run the plan is reset to `sequential`.
+
+      1.3. Two progress modes are available in the engine:
+         1.3.1. A terminal-friendly progress bar using `progressr` when `config$sim_progress = TRUE`.
+         1.3.2. A per-simulation message mode (`config$print_sim_numbers = TRUE`) which prints lines like `Sim 3/100 (sweep=30)`; this mode disables inner parallel mapping to preserve ordered, readable messages.
+
+   2. Outputs and canonical artifacts
+
+      2.1. All outputs are written under the repository `output/` folder by default. The engine accepts an `output_root` argument to override the root directory, but the master sets this so produced files land under `output/`.
+
+      2.2. Canonical artifacts produced by a sweep (for each `outfile_stem` and `outcome`) are:
+         2.2.1. `output/.../tabs/{outfile_stem}_{outcome}_long.csv` — the canonical tidy long CSV with one row per series × sweep value. The plotting routines read this file back as the single source of truth for figures.
+         2.2.2. `output/.../tabs/{outfile_stem}_{outcome}_meta.csv` — a companion key/value metadata CSV that records the run configuration (seed, `sims`, `parallel_layer`, `effect_mult` semantics, DGP flags such as whether binary effects were applied on the probability scale, and other settings). This file is the machine-readable record of exactly how the long CSV was produced.
+         2.2.3. Optional Excel workbook `{outfile_stem}_{outcome}.xlsx` with sheets `long` and `meta` is written when the `writexl` package is available.
+         2.2.4. Figures are written to `output/.../figs/` in PDF and PNG formats. Use `code/cattle/regenerate_figs_from_csv.R` to re-create figures from the canonical long CSV if you need to tweak styling without re-running the simulations.
+
+   3. Binary DGP semantics and estimation choices
+
+      3.1. Binary outcomes are simulated from an event-level linear predictor on the link scale and then converted to a baseline probability.
+         3.1.1. The engine assembles a link-scale predictor (logit link) that includes `mu_baseline`, association and cow random intercepts, the month-level AR term `m_{ijt}`, and the event-level AR term `e_{ijte}`.
+         3.1.2. The baseline (control) probability is computed as \(p^{(0)} = \operatorname{logit}^{-1}(\eta)\).
+
+      3.2. Treatment effects for binary outcomes are currently applied as a multiplicative factor on this baseline probability (percent-change on the probability scale):
+         3.2.1. For treated units the simulated probability is set to
+         \(p^{(1)} = \operatorname{clamp}(p^{(0)} \times \text{effect\_mult}[a] + \tau_i, 0, 1)\),
+         where `tau_i` is an optional additive heterogeneity term stored in the metadata and `clamp()` enforces bounds in \([0,1]\).
+         3.2.2. The engine records this DGP choice in the meta CSV so downstream users know the effect multiplier refers to a percent change on the probability scale (not an odds-ratio).
+
+      3.3. Estimation
+         3.3.1. ITT is estimated with a linear regression (`lm`). For binary outcomes this is a linear probability model (LPM) so coefficients are interpretable as differences in probability (percentage points). This choice keeps the estimator on the same scale as the DGP's probability multiplier and avoids convergence and complexity issues in Monte Carlo loops.
+         3.3.2. TOT is estimated using linear 2SLS via `AER::ivreg()` (assignment indicators as instruments for actual receipt). These IV estimates are likewise on the probability/difference scale when the LPM is used.
+         3.3.3. The engine computes cluster-robust standard errors (association-level) using `sandwich::vcovCL`. If cluster vcov computation fails (e.g. tiny samples or numerical problems) the code falls back to heteroskedasticity-robust HC-type vcov to avoid aborting long Monte Carlo runs. These behaviors and fallbacks are documented in the meta CSV.
+
+      3.4. Note on heterogeneity scale
+         3.4.1. The current implementation applies per-association heterogeneity terms for binary outcomes additively on the probability scale (the `tau_i` in §3.2). If you prefer heterogeneity on the link scale (i.e. adding `tau_i` to the logit before inverse-logit), that is an alternate, equally defensible specification; it changes how treatment heterogeneity interacts with extreme baseline probabilities and can be implemented by adding heterogeneity to the link-term prior to inverse-logit. The engine's metadata records which convention was used for each run — check the `_meta.csv` if you need to know exactly which variant produced the results.
+
+   4. Practical recommendations
+
+      4.1. Monte Carlo repetitions: `sims` must be large enough for stable power estimates; use `sims >= 500` (preferably 1,000) for final design decisions. Small `sims` like 6 or 10 are useful for smoke tests only and will produce noisy or degenerate empirical power values (e.g. 0, 0.5, 1.0).
+
+      4.2. Reproducibility: each run writes the seed and full run configuration to the `_meta.csv`. To reproduce a figure exactly, re-run with the same `seed`, `sweep_values`, and `parallel_layer` and/or use the canonical `_long.csv` plus `regenerate_figs_from_csv.R` to redraw the plots.
+
+      4.3. Population sampling: for efficiency the engine does not instantiate the full `cows_per_association` population in memory when only a subset is tagged. Instead it constructs an ID frame and samples `cows_tagged_per_association` without replacement; outcomes and random effects are generated only for the tagged cows. If you want to model the full population (e.g. to study sampling bias when tagging is non-random), that can be implemented as an optional two-stage sampling step; the R code and metadata make it straightforward to add this extension.
+
 
 # 4. Interpretation: Why Power Increases with Tagging (and Why It Saturates)
 

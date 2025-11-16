@@ -100,3 +100,9 @@ inv_logit_clamp <- function(x, eps = 1e-6) {
   p <- 1 / (1 + exp(-x))
   pmin(pmax(p, eps), 1 - eps)
 }
+
+# Logit with clamping (inverse of inv_logit_clamp)
+logit_clamp <- function(p, eps = 1e-6) {
+  p_clamped <- pmin(pmax(p, eps), 1 - eps)
+  log(p_clamped / (1 - p_clamped))
+}
